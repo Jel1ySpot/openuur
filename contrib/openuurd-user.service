@@ -1,0 +1,14 @@
+[Unit]
+Description=openuur UU native terminal and Wayland desktop host
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/openuurd run
+Restart=on-failure
+RestartSec=3
+Environment=RUST_LOG=openuur=info,openuurd=info
+
+[Install]
+WantedBy=default.target

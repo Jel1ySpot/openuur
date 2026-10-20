@@ -1,0 +1,21 @@
+[Unit]
+Description=openuur UU native terminal host
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/openuurd run
+Restart=on-failure
+RestartSec=3
+# openuurd reads ~/.config/openuur/config.toml. Run it as the account owner
+# (for a user service, or set User= below for a system service).
+Environment=RUST_LOG=openuur=info,openuurd=info
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.config/openuur
+
+[Install]
+WantedBy=multi-user.target
