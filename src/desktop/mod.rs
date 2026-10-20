@@ -21,6 +21,8 @@ pub mod video_track;
 pub mod virtual_audio;
 pub use encoder::FPS;
 
+#[cfg(all(target_os = "linux", feature = "desktop"))]
+mod uinput_scroll;
 #[cfg(not(target_os = "linux"))]
 mod unsupported;
 #[cfg(all(target_os = "linux", feature = "desktop"))]

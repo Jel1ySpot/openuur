@@ -661,6 +661,9 @@ fn install_host_channels_legacy(
                                             .and_then(|h| wire::uint(&h, 1))
                                             .unwrap_or(0);
                                         if rpc.iter().any(|f| f.number == 28) {
+                                            tracing::debug!(
+                                                "native UU terminal check_env request {id} answered"
+                                            );
                                             let _ = channel
                                                 .send(&bytes::Bytes::from(
                                                     wire::terminal_env_response(id),
@@ -1179,6 +1182,12 @@ fn install_host_channels(
                             terminal.handle(&data);
                             return;
                         }
+                        if label == "BINARY_DATA_CHANNEL" {
+                            tracing::debug!(
+                                "native UU non-TERM BINARY message: {} bytes",
+                                data.len()
+                            );
+                        }
 
                         // Official ClipboardChange (field 17), possibly chunked.
                         if let Some(fields) = wire::decode(&data) {
@@ -1270,40 +1279,45 @@ fn install_host_channels(
                                     return;
                                 }
                             }
-                            if label != "CONTROL_DATA_CHANNEL" {
-                                return;
-                            }
-                            if rpc.is_some() {
-                                if let Some(header) = wire::blob(&rpc_fields, 1) {
-                                    let id = wire::decode(header)
-                                        .and_then(|header| wire::uint(&header, 1))
-                                        .unwrap_or(0);
-                                    if rpc_fields.iter().any(|field| field.number == 28) {
-                                        let body = wire::terminal_env_response(id);
+                            // Terminal RPCs (check_env/rename) arrive on either
+                            // CONTROL or BINARY: the official Windows client
+                            // sends check_env on BINARY next to TERM frames.
+                            if let Some(header) = wire::blob(&rpc_fields, 1) {
+                                let id = wire::decode(header)
+                                    .and_then(|header| wire::uint(&header, 1))
+                                    .unwrap_or(0);
+                                if rpc_fields.iter().any(|field| field.number == 28) {
+                                    tracing::debug!(
+                                        "native UU terminal check_env request {id} answered"
+                                    );
+                                    let body = wire::terminal_env_response(id);
+                                    let _ = channel
+                                        .send(&bytes::Bytes::from(body))
+                                        .await;
+                                    return;
+                                }
+                                if let Some(body) = wire::blob(&rpc_fields, 29) {
+                                    if let Some(body) = wire::decode(body) {
+                                        let session = wire::uint(&body, 1).unwrap_or(0) as u16;
+                                        let name = wire::blob(&body, 2)
+                                            .and_then(|value| std::str::from_utf8(value).ok())
+                                            .unwrap_or("");
+                                        let _ = manager.rename(session, name);
+                                        let body = wire::terminal_rename_response(
+                                            id,
+                                            session as u64,
+                                        );
                                         let _ = channel
                                             .send(&bytes::Bytes::from(body))
                                             .await;
                                         return;
                                     }
-                                    if let Some(body) = wire::blob(&rpc_fields, 29) {
-                                        if let Some(body) = wire::decode(body) {
-                                            let session = wire::uint(&body, 1).unwrap_or(0) as u16;
-                                            let name = wire::blob(&body, 2)
-                                                .and_then(|value| std::str::from_utf8(value).ok())
-                                                .unwrap_or("");
-                                            let _ = manager.rename(session, name);
-                                            let body = wire::terminal_rename_response(
-                                                id,
-                                                session as u64,
-                                            );
-                                            let _ = channel
-                                                .send(&bytes::Bytes::from(body))
-                                                .await;
-                                            return;
-                                        }
-                                    }
                                 }
-                                match case {
+                            }
+                            if label != "CONTROL_DATA_CHANNEL" {
+                                return;
+                            }
+                            match case {
                                     2 | 3 | 4 | 6 => {
                                         if let (Some(settings), Some(desktop)) =
                                             (settings.as_ref(), desktop.as_ref())
@@ -1377,7 +1391,6 @@ fn install_host_channels(
                                     }
                                     _ => {}
                                 }
-                            }
                         }
 
                         if let Some(simple) = initialization::parse_simple_action(&data) {
@@ -1782,7 +1795,7 @@ fn handle_desktop_input(input: Arc<dyn InputSink>, value: &Value) -> bool {
     let integer = |name: &str| {
         value
             .get(name)
-            .and_then(Value::as_i64)
+            .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f.round() as i64)))
             .and_then(|n| i32::try_from(n).ok())
     };
     match action {
@@ -1833,7 +1846,10 @@ fn handle_desktop_input(input: Arc<dyn InputSink>, value: &Value) -> bool {
         }
         "mouse_scroll" => {
             if let (Some(dx), Some(dy)) = (integer("delta_x"), integer("delta_y")) {
+                tracing::debug!("desktop scroll: dx={dx} dy={dy}");
                 input.scroll(dx, dy);
+            } else {
+                tracing::debug!("desktop scroll: unsupported delta shape: {value}");
             }
         }
         "text_input" => {
@@ -2043,6 +2059,36 @@ mod local_webrtc_tests {
             }
         }
         assert!(rtc::channel_open(&channels[4]), "data channel did not open");
+
+        // The official Windows client sends terminal_check_env_req on BINARY
+        // next to TERM frames; it must be answered there, not only on CONTROL.
+        let _ = channels[4]
+            .send(&bytes::Bytes::from(wire::request(7, 28, &[])))
+            .await;
+        let mut env_answered = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            tokio::select! {
+                Some((channel, data)) = viewer_rx.recv() => {
+                    if channel == 4 {
+                        if let Some(fields) = wire::decode(&data) {
+                            if let Some(rpc) = wire::blob(&fields, 22) {
+                                if let Some(rpc) = wire::decode(rpc) {
+                                    if wire::blob(&rpc, 24).is_some() {
+                                        env_answered = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+            if env_answered {
+                break;
+            }
+        }
+        assert!(env_answered, "check_env response not received on BINARY");
 
         let open = serde_json::json!({"cols":80,"rows":24,"option":"none","shell":"bash"});
         let _ = channels[4]

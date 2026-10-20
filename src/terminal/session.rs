@@ -4,6 +4,7 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -89,6 +90,27 @@ impl InnerSession {
             .unwrap_or(0);
         info
     }
+
+    /// Signal the shell's process group. `portable-pty` makes the child a
+    /// session leader, so a negative pid reaches a foreground job such as an
+    /// editor as well as the shell itself.
+    #[cfg(unix)]
+    fn signal(&self, signal: i32) {
+        let Ok(child) = self.child.lock() else {
+            return;
+        };
+        let Some(pid) = child.process_id().and_then(|pid| i32::try_from(pid).ok()) else {
+            return;
+        };
+        unsafe {
+            if libc::kill(-pid, signal) != 0 {
+                libc::kill(pid, signal);
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn signal(&self, _signal: i32) {}
 }
 
 struct Inner {
@@ -227,11 +249,16 @@ impl SessionManager {
             }
         }
         let session_id = inner.allocate_id()?;
+        let shell_name = Path::new(&shell)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&shell)
+            .to_owned();
         let name = request
             .name
             .clone()
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| format!("{shell}-{session_id}"));
+            .unwrap_or_else(|| format!("{shell_name}-{session_id}"));
 
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
@@ -241,10 +268,29 @@ impl SessionManager {
             pixel_height: 0,
         })?;
 
-        let mut command = CommandBuilder::new(resolve_shell(&shell));
+        // Behave like an SSH login: run the account's shell with a login
+        // profile, in the account's home, with the environment sshd provides.
+        let shell_path = resolve_shell(&shell);
+        let mut command = CommandBuilder::new(&shell_path);
+        if is_login_shell(&shell_path) {
+            command.arg("-l");
+        }
+        command.env("SHELL", absolute_shell(&shell_path));
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
-        if let Some(home) = dirs::home_dir() {
+        if std::env::var_os("LANG").is_none() {
+            command.env("LANG", "C.UTF-8");
+        }
+        if let Some(account) = account() {
+            if !account.name.is_empty() {
+                command.env("USER", &account.name);
+                command.env("LOGNAME", &account.name);
+            }
+            if !account.home.is_empty() {
+                command.env("HOME", &account.home);
+                command.cwd(&account.home);
+            }
+        } else if let Some(home) = dirs::home_dir() {
             command.cwd(home);
         }
 
@@ -336,25 +382,72 @@ impl SessionManager {
     }
 
     pub fn signal(&self, session_id: u16, signal: &str) -> Result<()> {
-        match signal.to_ascii_uppercase().as_str() {
-            "SIGINT" | "INT" | "C" => self.write(session_id, b"\x03"),
-            "SIGQUIT" | "QUIT" => self.write(session_id, b"\x1c"),
-            "SIGTERM" | "TERM" | "KILL" => self.kill(session_id),
+        let name = signal.trim().trim_start_matches("SIG").to_ascii_uppercase();
+        if let Ok(number) = name.parse::<i32>() {
+            return self.signal_group(session_id, number);
+        }
+        match name.as_str() {
+            "INT" | "C" => self.write(session_id, b"\x03"),
+            "QUIT" => self.write(session_id, b"\x1c"),
+            "KILL" => self.kill(session_id),
+            #[cfg(unix)]
+            "TERM" => self.signal_group(session_id, libc::SIGTERM),
+            #[cfg(unix)]
+            "HUP" => self.signal_group(session_id, libc::SIGHUP),
             other => Err(Error::Session(format!("unsupported signal {other}"))),
         }
     }
 
-    pub fn kill(&self, session_id: u16) -> Result<()> {
+    /// Deliver `signal` to the shell's process group, the way a hung-up SSH
+    /// connection does. The session stays registered so the client can still
+    /// list or reattach it.
+    #[cfg(unix)]
+    pub fn signal_group(&self, session_id: u16, signal: i32) -> Result<()> {
         let inner = self.inner.lock().expect("session manager poisoned");
         let session = inner
             .sessions
             .get(&session_id)
             .ok_or_else(|| Error::Session(format!("terminal session {session_id} not found")))?;
-        let mut child = session
-            .child
-            .lock()
-            .map_err(|_| Error::Session("terminal child poisoned".to_owned()))?;
-        child.kill()?;
+        session.signal(signal);
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    pub fn signal_group(&self, _session_id: u16, _signal: i32) -> Result<()> {
+        Err(Error::Session(
+            "signals are not supported on this platform".to_owned(),
+        ))
+    }
+
+    /// Hang up the session without removing it, matching the `CLOSE` frame.
+    pub fn close(&self, session_id: u16) -> Result<()> {
+        #[cfg(unix)]
+        {
+            self.signal_group(session_id, libc::SIGHUP)
+        }
+        #[cfg(not(unix))]
+        {
+            self.kill(session_id)
+        }
+    }
+
+    /// End a session and drop it from the list, matching the official
+    /// client's `SIGHUP` followed by `SIGKILL`.
+    pub fn kill(&self, session_id: u16) -> Result<()> {
+        let mut inner = self.inner.lock().expect("session manager poisoned");
+        let session = inner
+            .sessions
+            .remove(&session_id)
+            .ok_or_else(|| Error::Session(format!("terminal session {session_id} not found")))?;
+        #[cfg(unix)]
+        {
+            session.signal(libc::SIGHUP);
+            session.signal(libc::SIGKILL);
+        }
+        #[cfg(not(unix))]
+        if let Ok(mut child) = session.child.lock() {
+            let _ = child.kill();
+        }
         Ok(())
     }
 
@@ -457,12 +550,9 @@ fn spawn_waiter(
             }
         }
         if let Ok(mut inner) = inner.lock() {
-            if let Some(session) = inner.sessions.get_mut(&session_id) {
-                session.info.state = "exited".to_owned();
-                session.info.attachable = false;
-                session.info.exit_code = Some(exit_code);
-                session.info.last_active_ms = 0;
-            }
+            // A finished shell has nothing to reattach to, so drop it from the
+            // list the way an SSH session disappears when its shell exits.
+            inner.sessions.remove(&session_id);
         }
         let _ = events.send(SessionEvent::Exited {
             session_id,
@@ -475,17 +565,120 @@ pub fn default_shell() -> String {
     if cfg!(windows) {
         "powershell".to_owned()
     } else {
-        std::env::var("SHELL")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| {
-                if command_in_path("bash") {
-                    "bash".to_owned()
-                } else {
-                    "sh".to_owned()
-                }
-            })
+        login_shell()
     }
+}
+
+/// The account's login shell, the way `sshd` picks it: the password database
+/// entry, then `$SHELL`, then `bash`, then `sh`.
+#[cfg(unix)]
+fn login_shell() -> String {
+    if let Some(account) = account() {
+        if is_executable(&account.shell) {
+            return account.shell;
+        }
+    }
+    if let Ok(shell) = std::env::var("SHELL") {
+        if is_executable(&shell) {
+            return shell;
+        }
+    }
+    if command_in_path("bash") {
+        "bash".to_owned()
+    } else {
+        "/bin/sh".to_owned()
+    }
+}
+
+#[cfg(not(unix))]
+fn login_shell() -> String {
+    "powershell".to_owned()
+}
+
+#[cfg(unix)]
+struct Account {
+    name: String,
+    home: String,
+    shell: String,
+}
+
+#[cfg(unix)]
+fn account() -> Option<Account> {
+    use std::ffi::CStr;
+
+    let mut buffer = vec![0u8; 4096];
+    loop {
+        let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let rc = unsafe {
+            libc::getpwuid_r(
+                libc::getuid(),
+                &mut entry,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE && buffer.len() < (1 << 20) {
+            let length = buffer.len() * 2;
+            buffer.resize(length, 0);
+            continue;
+        }
+        if rc != 0 || result.is_null() {
+            return None;
+        }
+        let field = |value: *const libc::c_char| {
+            if value.is_null() {
+                String::new()
+            } else {
+                unsafe { CStr::from_ptr(value) }
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        };
+        return Some(Account {
+            name: field(entry.pw_name),
+            home: field(entry.pw_dir),
+            shell: field(entry.pw_shell),
+        });
+    }
+}
+
+#[cfg(unix)]
+fn is_executable(path: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    !path.is_empty()
+        && std::fs::metadata(path)
+            .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+}
+
+/// Shells that accept `-l` and load their login profiles with it.
+fn is_login_shell(shell: &str) -> bool {
+    let name = Path::new(shell)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    matches!(
+        name,
+        "sh" | "bash" | "dash" | "ksh" | "mksh" | "zsh" | "fish" | "nu"
+    )
+}
+
+/// Absolute form of a shell name for the child's `SHELL` variable.
+fn absolute_shell(shell: &str) -> String {
+    if Path::new(shell).is_absolute() {
+        return shell.to_owned();
+    }
+    std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| directory.join(shell))
+                .find(|candidate| candidate.is_file())
+        })
+        .and_then(|path| path.to_str().map(str::to_owned))
+        .unwrap_or_else(|| shell.to_owned())
 }
 
 fn command_in_path(program: &str) -> bool {
@@ -530,6 +723,93 @@ fn resolve_shell(shell: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kill_removes_the_session_from_the_list() {
+        if cfg!(windows) {
+            return;
+        }
+        let manager = SessionManager::new(None);
+        let response = manager
+            .open(&OpenRequest {
+                session_id: None,
+                name: None,
+                shell: Some("sh".to_owned()),
+                cols: Some(80),
+                rows: Some(24),
+            })
+            .unwrap();
+        assert!(manager.get(response.session_id).is_some());
+        manager.kill(response.session_id).unwrap();
+        assert!(manager.get(response.session_id).is_none());
+        assert!(manager.list().sessions.is_empty());
+        assert!(manager.kill(response.session_id).is_err());
+    }
+
+    #[test]
+    fn default_shell_is_an_executable_login_shell() {
+        if cfg!(windows) {
+            return;
+        }
+        let shell = default_shell();
+        assert!(
+            std::path::Path::new(&shell).is_absolute() || command_in_path(&shell),
+            "default shell {shell:?} does not resolve"
+        );
+        assert!(is_login_shell(&shell) || std::path::Path::new(&shell).is_file());
+    }
+
+    #[test]
+    fn default_shell_follows_the_account_database() {
+        if cfg!(windows) {
+            return;
+        }
+        if let Some(account) = account() {
+            if is_executable(&account.shell) {
+                assert_eq!(default_shell(), account.shell);
+            }
+        }
+    }
+
+    #[test]
+    fn default_shell_reaches_the_child_environment() {
+        if cfg!(windows) {
+            return;
+        }
+        let manager = SessionManager::new(None);
+        let mut events = manager.subscribe();
+        // Use a plain shell so the test does not depend on interactive line
+        // editing; the environment setup is the same for every shell.
+        let response = manager
+            .open(&OpenRequest {
+                session_id: None,
+                name: None,
+                shell: Some("sh".to_owned()),
+                cols: Some(80),
+                rows: Some(24),
+            })
+            .unwrap();
+        manager.write(response.session_id, b"printenv\n").unwrap();
+        let expected = format!("SHELL={}", absolute_shell("sh"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut output = Vec::new();
+        while Instant::now() < deadline && !String::from_utf8_lossy(&output).contains(&expected) {
+            if let Ok(event) = events.try_recv() {
+                if let SessionEvent::Output { session_id, data } = event {
+                    if session_id == response.session_id {
+                        output.extend_from_slice(&data);
+                    }
+                }
+            } else {
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        manager.kill(response.session_id).unwrap();
+        assert!(
+            String::from_utf8_lossy(&output).contains(&expected),
+            "child did not export {expected}"
+        );
+    }
 
     #[test]
     fn create_list_write_and_kill() {

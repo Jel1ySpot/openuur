@@ -92,6 +92,12 @@ impl Error {
         matches!(self, Self::Api { status, .. } if matches!(status, 404 | 405 | 501))
     }
 
+    /// Request shape was rejected (wrong method or body). Safe to try the next
+    /// recovered shape; auth and server errors are not.
+    pub fn is_shape_rejected(&self) -> bool {
+        matches!(self, Self::Api { status, .. } if matches!(status, 400 | 404 | 405 | 422 | 501))
+    }
+
     pub fn is_unauthorized(&self) -> bool {
         matches!(self, Self::Api { status, .. } if matches!(status, 401 | 403))
     }

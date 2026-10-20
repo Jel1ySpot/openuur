@@ -118,6 +118,23 @@ fn resolve_shell(name: &str) -> Option<String> {
         .then_some(absolute)
 }
 
+/// The official client hardcodes `/bin/bash` when it opens a Linux terminal.
+/// SSH ignores client shell choices entirely, so that placeholder means
+/// "use the account's login shell".
+fn is_client_default_shell(shell: &str) -> bool {
+    matches!(
+        shell.trim(),
+        "sh" | "bash"
+            | "dash"
+            | "/bin/sh"
+            | "/bin/bash"
+            | "/bin/dash"
+            | "/usr/bin/sh"
+            | "/usr/bin/bash"
+            | "/usr/bin/dash"
+    )
+}
+
 fn reply(code: i64, message: &str) -> Vec<u8> {
     json!({"code": code, "message": message})
         .to_string()
@@ -152,9 +169,18 @@ impl HostTerminal {
             return;
         };
         let session = frame.session;
+        if frame.kind != STDIN {
+            tracing::debug!(
+                "UU terminal frame: kind={} session={} payload={}",
+                frame.kind,
+                frame.session,
+                frame.payload.len()
+            );
+        }
         match frame.kind {
             OPEN => {
                 if !self.unlocked.load(std::sync::atomic::Ordering::Acquire) {
+                    tracing::info!("UU terminal open: password required");
                     self.send(
                         OPEN_RESP,
                         session,
@@ -180,19 +206,31 @@ impl HostTerminal {
                     shell: value
                         .get("shell")
                         .and_then(Value::as_str)
-                        .and_then(resolve_shell),
+                        .and_then(resolve_shell)
+                        .filter(|shell| !is_client_default_shell(shell)),
                     cols: Some(cols),
                     rows: Some(rows),
                 };
                 match self.manager.open(&request) {
                     Ok(response) => {
                         let id = u32::from(response.session_id);
+                        tracing::info!(
+                            "UU terminal open: session={} created={} shell={} cols={} rows={}",
+                            response.session_id,
+                            response.created,
+                            response.shell.as_deref().unwrap_or("-"),
+                            cols,
+                            rows
+                        );
                         self.attached.lock().unwrap().insert(response.session_id);
                         let payload =
                             serde_json::to_vec(&response).unwrap_or_else(|_| reply(0, "ok"));
                         self.send(OPEN_RESP, id, &payload);
                     }
-                    Err(error) => self.send(OPEN_RESP, session, &reply(1, &error.to_string())),
+                    Err(error) => {
+                        tracing::warn!("UU terminal open failed: {error}");
+                        self.send(OPEN_RESP, session, &reply(1, &error.to_string()));
+                    }
                 }
             }
             STDIN => {
@@ -218,14 +256,28 @@ impl HostTerminal {
                         .map(str::to_owned)
                         .or_else(|| {
                             value.as_object().and_then(|o| {
-                                o.values().find_map(|v| v.as_str().map(str::to_owned))
+                                o.values()
+                                    .find_map(|v| v.as_str().map(str::to_owned))
+                                    .or_else(|| {
+                                        o.values().find_map(|v| v.as_i64().map(|n| n.to_string()))
+                                    })
                             })
                         })
                         .unwrap_or_else(|| "SIGINT".to_owned());
                     let _ = self.manager.signal(id, &name);
                 }
             }
-            CLOSE | DETACH => {
+            CLOSE => {
+                if let Ok(id) = u16::try_from(session) {
+                    self.attached.lock().unwrap().remove(&id);
+                    // A closed terminal hangs the shell up, like closing an
+                    // SSH session; the session stays listable until it exits.
+                    if let Err(error) = self.manager.close(id) {
+                        tracing::debug!("UU terminal close failed: {error}");
+                    }
+                }
+            }
+            DETACH => {
                 if let Ok(id) = u16::try_from(session) {
                     self.attached.lock().unwrap().remove(&id);
                 }
@@ -234,14 +286,26 @@ impl HostTerminal {
                 let id = if session != 0 {
                     u16::try_from(session).ok()
                 } else {
-                    json(&frame.payload)
+                    let value = json(&frame.payload);
+                    value
                         .get("session_id")
+                        .or_else(|| value.get("sessionId"))
+                        .or_else(|| value.get("id"))
                         .and_then(Value::as_u64)
+                        .or_else(|| {
+                            value
+                                .as_object()
+                                .and_then(|o| o.values().find_map(Value::as_u64))
+                        })
                         .and_then(|v| u16::try_from(v).ok())
                 };
                 match id {
                     Some(id) => {
                         let result = self.manager.kill(id);
+                        match &result {
+                            Ok(()) => tracing::info!("UU terminal session {id} killed"),
+                            Err(error) => tracing::warn!("UU terminal kill failed: {error}"),
+                        }
                         self.attached.lock().unwrap().remove(&id);
                         let payload = match result {
                             Ok(()) => reply(0, "ok"),
@@ -434,6 +498,15 @@ impl ViewerTerminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_default_shell_placeholder_is_ignored() {
+        assert!(is_client_default_shell("/bin/bash"));
+        assert!(is_client_default_shell("bash"));
+        assert!(is_client_default_shell("/usr/bin/sh"));
+        assert!(!is_client_default_shell("/bin/zsh"));
+        assert!(!is_client_default_shell("/run/current-system/sw/bin/nu"));
+    }
 
     #[test]
     fn frame_layout_matches_uu() {

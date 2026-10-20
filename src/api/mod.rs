@@ -394,37 +394,52 @@ impl ApiClient {
 
     /// Rename a device.
     ///
-    /// The exact HTTP method is not fully recoverable from the static sample.
-    /// The observed shared API exposes `renameDevice(id, name)` and the client
-    /// sends a JSON body with a `device_name` field. We try `PUT` first and
-    /// fall back to `POST` on 404/405/501.
+    /// The live API wants `PUT /api/v1/device/{id}` with an `alias` field
+    /// (a bare `device_name` is rejected with `missing field "alias"`).
+    /// Older shapes are kept as fallbacks for other account backends.
     pub async fn rename_device(&self, device_id: &str, name: &str) -> Result<Value> {
         let path = format!("/api/v1/device/{device_id}");
-        let body = serde_json::to_string(&json!({ "device_name": name }))?;
-        match self
-            .send(Method::PUT, &path, Some(body.clone()), None)
-            .await
-        {
-            Ok(value) => return Ok(value),
-            Err(err) if err.is_method_not_allowed() => {}
-            Err(err) => return Err(err),
-        }
-        match self
-            .send(Method::POST, &path, Some(body.clone()), None)
-            .await
-        {
-            Ok(value) => return Ok(value),
-            Err(err) if err.is_method_not_allowed() => {}
-            Err(err) => return Err(err),
+        let bodies = [
+            json!({ "alias": name }),
+            json!({ "alias": name, "device_name": name }),
+            json!({ "device_name": name }),
+        ];
+        let methods = [Method::PUT, Method::POST];
+        let mut last_error = None;
+        for method in methods {
+            for body in &bodies {
+                let body = serde_json::to_string(body)?;
+                tracing::debug!("trying device rename: {method} {path} {body}");
+                match self.send(method.clone(), &path, Some(body), None).await {
+                    Ok(value) => {
+                        tracing::info!("device rename accepted: {method} {path}");
+                        return Ok(value);
+                    }
+                    Err(err) if err.is_shape_rejected() => {
+                        if let Error::Api { body, .. } = &err {
+                            tracing::debug!("device rename rejected: {method} {path}: {body}");
+                        }
+                        last_error = Some(err);
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
         }
         // Last-resort shape seen in some account APIs: update a preference.
-        self.send(
-            Method::POST,
-            &format!("/api/v1/device/{device_id}/preferences"),
-            Some(body),
-            None,
-        )
-        .await
+        let body = serde_json::to_string(&json!({ "device_name": name }))?;
+        match self
+            .send(
+                Method::POST,
+                &format!("{path}/preferences"),
+                Some(body),
+                None,
+            )
+            .await
+        {
+            Ok(value) => Ok(value),
+            Err(err) if err.is_shape_rejected() => Err(last_error.unwrap_or(err)),
+            Err(err) => Err(err),
+        }
     }
 
     /// `POST /api/v1/device/wallpaper`

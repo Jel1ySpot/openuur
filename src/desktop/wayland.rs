@@ -286,6 +286,7 @@ async fn supervise(
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(5));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_transform = HashMap::<u32, Option<u32>>::new();
+    let mut wheel = super::uinput_scroll::WheelBackend::default();
     let (closed_tx, mut closed_rx) = mpsc::channel::<()>(1);
     spawn_closed_watcher(&current.handle, closed_tx.clone());
     loop {
@@ -339,6 +340,7 @@ async fn supervise(
                             current.handle.ashpd_session(),
                             target,
                             event,
+                            &mut wheel,
                         )
                         .await;
                         event = next;
@@ -350,6 +352,7 @@ async fn supervise(
                     current.handle.ashpd_session(),
                     target,
                     event,
+                    &mut wheel,
                 )
                 .await;
             }
@@ -546,6 +549,7 @@ async fn dispatch_input(
     session: &Session<RemoteDesktop>,
     target: (u32, u32, u32),
     event: InputEvent,
+    wheel: &mut super::uinput_scroll::WheelBackend,
 ) {
     let (stream_node, width, height) = target;
     let result = match event {
@@ -568,9 +572,15 @@ async fn dispatch_input(
             remote.notify_pointer_button(session, button, pressed).await
         }
         InputEvent::Scroll { dx, dy } => {
-            let x = dx as f64 / 120.0 * 15.0;
-            let y = dy as f64 / 120.0 * 15.0;
-            remote.notify_pointer_axis(session, x, y).await
+            // A real wheel device produces axis_value120, which clients such
+            // as Zed require; KWin's portal fake input only sends continuous
+            // axis events. Fall back to the portal when uinput is unavailable.
+            if wheel.send(dx, dy) {
+                return;
+            }
+            remote
+                .notify_pointer_axis(session, smooth_scroll(dx), smooth_scroll(dy))
+                .await
         }
         InputEvent::Key { vk, pressed } => {
             let Some(keysym) = windows_vk_to_keysym(vk) else {
@@ -602,11 +612,34 @@ async fn dispatch_input(
 }
 
 fn wire_button(button: i32) -> Option<i32> {
+    // UU uses 1/2/4 for left/right/middle. The portal RemoteDesktop API
+    // expects Linux evdev button codes (BTN_LEFT/BTN_RIGHT/BTN_MIDDLE),
+    // not X11 or UU button numbers.
     match button {
-        1 => Some(1),
-        2 => Some(3),
-        4 => Some(2),
+        1 => Some(0x110),
+        2 => Some(0x111),
+        4 => Some(0x112),
         _ => None,
+    }
+}
+
+/// Normalize UU wheel deltas to portal axis units.
+///
+/// The official client sends smooth pixel deltas (tens per event), so those
+/// pass through unchanged, matching the portal's "same as pointer motion"
+/// contract. Windows wheel deltas (120 per notch) map to one 10-unit axis
+/// step, and notch counts (1..5) map to 10 units each.
+fn smooth_scroll(value: i32) -> f64 {
+    let value = f64::from(value);
+    let magnitude = value.abs();
+    if magnitude == 0.0 {
+        0.0
+    } else if magnitude <= 5.0 {
+        value * 10.0
+    } else if magnitude >= 100.0 {
+        value / 12.0
+    } else {
+        value
     }
 }
 
@@ -675,10 +708,23 @@ mod tests {
 
     #[test]
     fn wire_buttons_follow_uuit_bitmask() {
-        assert_eq!(wire_button(1), Some(1));
-        assert_eq!(wire_button(2), Some(3));
-        assert_eq!(wire_button(4), Some(2));
+        // UU 1/2/4 -> evdev BTN_LEFT/BTN_RIGHT/BTN_MIDDLE.
+        assert_eq!(wire_button(1), Some(0x110));
+        assert_eq!(wire_button(2), Some(0x111));
+        assert_eq!(wire_button(4), Some(0x112));
         assert_eq!(wire_button(3), None);
+    }
+
+    #[test]
+    fn wheel_deltas_normalize_to_axis_units() {
+        assert_eq!(smooth_scroll(0), 0.0);
+        assert_eq!(smooth_scroll(1), 10.0);
+        assert_eq!(smooth_scroll(-3), -30.0);
+        assert_eq!(smooth_scroll(120), 10.0);
+        assert_eq!(smooth_scroll(-120), -10.0);
+        // Smooth pixel deltas pass through unchanged.
+        assert_eq!(smooth_scroll(15), 15.0);
+        assert_eq!(smooth_scroll(-44), -44.0);
     }
 
     #[test]
