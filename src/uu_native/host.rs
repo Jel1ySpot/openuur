@@ -4,7 +4,7 @@
 use super::initialization::{self, Capabilities};
 use super::network_diagnostics;
 use super::rtc;
-use super::signal::{Event, Signal};
+use super::signal::{Event, Outbox, Signal};
 use super::system_actions::PeerActions;
 use super::system_metrics::Permission;
 use super::term::{self, HostTerminal};
@@ -36,8 +36,23 @@ struct Pending {
     client: String,
     app: String,
     header: Value,
+    created_at: std::time::Instant,
     desktop:
         Option<tokio::sync::oneshot::Receiver<std::result::Result<Arc<DesktopSession>, String>>>,
+}
+
+/// Process-lifetime host state. Signaling rooms reconnect underneath it, but
+/// WebRTC peers and terminal sessions survive.
+struct HostRuntime {
+    manager: SessionManager,
+    peers: HashMap<String, HostPeer>,
+    pending: Vec<Pending>,
+    outbox: Outbox,
+}
+
+enum RoomExit {
+    Reconnect { error: String, connected: bool },
+    Shutdown,
 }
 
 struct HostPeer {
@@ -91,66 +106,155 @@ impl HostPeer {
 pub async fn run(config: Config, password: Option<String>) -> Result<()> {
     crate::desktop::virtual_audio::init();
     let _virtual_audio = crate::desktop::virtual_audio::Cleanup;
-    let manager = SessionManager::new(password);
+    let mut runtime = HostRuntime {
+        manager: SessionManager::new(password),
+        peers: HashMap::new(),
+        pending: Vec::new(),
+        outbox: Outbox::new(),
+    };
     let mut backoff = Duration::from_secs(3);
     loop {
-        match connect_once(&config, manager.clone()).await {
-            Ok(()) => {
-                tracing::warn!("native UU host connection closed");
-                backoff = Duration::from_secs(3);
+        match enter_room(&config, &mut runtime).await {
+            RoomExit::Shutdown => break,
+            RoomExit::Reconnect { error, connected } => {
+                tracing::warn!("native UU host: {error}");
+                if connected {
+                    backoff = Duration::from_secs(3);
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
             }
-            Err(error) => tracing::warn!("native UU host: {error}"),
         }
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(Duration::from_secs(30));
     }
+    for peer in runtime.peers.values() {
+        peer.close().await;
+    }
+    Ok(())
 }
 
-async fn connect_once(config: &Config, manager: SessionManager) -> Result<()> {
-    let room = super::api::create(config).await?;
-    let mut signal = Signal::connect(&room.servers, &room.token, false)
-        .await
-        .map_err(Error::Transport)?;
+async fn enter_room(config: &Config, runtime: &mut HostRuntime) -> RoomExit {
+    let room = match super::api::create(config).await {
+        Ok(room) => room,
+        Err(error) => {
+            return RoomExit::Reconnect {
+                error: error.to_string(),
+                connected: false,
+            }
+        }
+    };
+    let mut signal = match Signal::connect(&room.servers, &room.token, false).await {
+        Ok(signal) => signal,
+        Err(error) => {
+            return RoomExit::Reconnect {
+                error,
+                connected: false,
+            }
+        }
+    };
+    runtime.outbox.attach(signal.sender());
     signal.room_info();
-    let mut events = manager.subscribe();
-    let mut peers: HashMap<String, HostPeer> = HashMap::new();
-    let mut pending: Vec<Pending> = Vec::new();
+    let events = runtime.manager.subscribe();
+    let exit = room_loop(config, runtime, &mut signal, events).await;
+    runtime.outbox.detach();
+    exit
+}
+
+async fn room_loop(
+    config: &Config,
+    runtime: &mut HostRuntime,
+    signal: &mut Signal,
+    mut events: broadcast::Receiver<crate::terminal::session::SessionEvent>,
+) -> RoomExit {
+    let mut tick = tokio::time::interval(Duration::from_secs(2));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut terminate =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    let mut interrupt =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
 
     loop {
         tokio::select! {
             message = signal.recv() => {
-                let Some(message) = message else { break; };
+                let Some(message) = message else {
+                    return RoomExit::Reconnect {
+                        error: "signaling stream ended".to_owned(),
+                        connected: true,
+                    };
+                };
                 match message {
-                    Event::Closed(error) => return Err(Error::Transport(error)),
+                    Event::Closed(error) => return RoomExit::Reconnect { error, connected: true },
                     Event::Text { name, data } | Event::Binary { name, data, .. } if name == "bmsg_push" => {
                         let status = data.get("data").and_then(|d| d.get("status")).and_then(Value::as_str).unwrap_or("-");
                         let available = data.get("data").and_then(|d| d.get("publisher_availability_status")).and_then(Value::as_str).unwrap_or("-");
                         tracing::info!("native UU device status: {status} availability={available}");
                     }
                     Event::Text { name, data } if name == "be-controlled" => {
-                        remember_connect(&mut pending, data, Vec::new(), config);
+                        remember_connect(&mut runtime.pending, data, Vec::new(), config);
                     }
                     Event::Binary { name, data, attachments } if name == "be-controlled" => {
-                        remember_connect(&mut pending, data, attachments, config);
+                        remember_connect(&mut runtime.pending, data, attachments, config);
                     }
                     Event::Text { name, data } | Event::Binary { name, data, .. } if name == "soac" => {
-                        handle_soac(&manager, &signal, &mut peers, &mut pending, &data, events.resubscribe(), config).await;
+                        handle_soac(
+                            &runtime.manager,
+                            &runtime.outbox,
+                            &mut runtime.peers,
+                            &mut runtime.pending,
+                            &data,
+                            events.resubscribe(),
+                            config,
+                        )
+                        .await;
                     }
                     Event::Text { name, data } | Event::Binary { name, data, .. } if name == "released" || name == "left" || name == "leave" => {
-                        release(&mut peers, &data).await;
+                        release(&mut runtime.peers, &data).await;
                     }
                     _ => {}
                 }
             }
             event = events.recv() => {
-                if matches!(event, Err(broadcast::error::RecvError::Closed)) { break; }
+                if matches!(event, Err(broadcast::error::RecvError::Closed)) {
+                    return RoomExit::Shutdown;
+                }
             }
+            _ = tick.tick() => maintain(runtime).await,
+            _ = wait_for_shutdown(&mut terminate) => return RoomExit::Shutdown,
+            _ = wait_for_shutdown(&mut interrupt) => return RoomExit::Shutdown,
         }
     }
-    for peer in peers.values() {
-        peer.close().await;
+}
+
+async fn wait_for_shutdown(signal: &mut Option<tokio::signal::unix::Signal>) {
+    match signal {
+        Some(signal) => {
+            let _ = signal.recv().await;
+        }
+        None => std::future::pending::<()>().await,
     }
-    Ok(())
+}
+
+/// Periodic cleanup: expired desktop offers are dropped (which stops their
+/// capture task), and peers that the WebRTC stack already closed are removed.
+async fn maintain(runtime: &mut HostRuntime) {
+    runtime
+        .pending
+        .retain(|pending| pending.created_at.elapsed() < Duration::from_secs(120));
+    let closed: Vec<String> = runtime
+        .peers
+        .iter()
+        .filter(|(_, peer)| {
+            matches!(
+                peer.pc.connection_state(),
+                RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed
+            )
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in closed {
+        if let Some(peer) = runtime.peers.remove(&key) {
+            peer.close().await;
+        }
+    }
 }
 
 fn remember_connect(
@@ -218,6 +322,7 @@ fn remember_connect(
         client: find_str(&header, &["client_id", "clientId"]).unwrap_or_default(),
         app: find_str(&header, &["app_control_id", "appControlId"]).unwrap_or_default(),
         header,
+        created_at: std::time::Instant::now(),
         desktop,
     });
     tracing::info!("native UU capture_type={capture_type} request remembered");
@@ -226,7 +331,7 @@ fn remember_connect(
 #[allow(clippy::too_many_arguments)]
 async fn create_peer(
     manager: &SessionManager,
-    signal: &Signal,
+    outbox: &Outbox,
     route: Route,
     header: &Value,
     desktop: Option<Arc<DesktopSession>>,
@@ -288,7 +393,7 @@ async fn create_peer(
     // once per outage; the viewer answers the host offer with `soac answer`.
     {
         let pc = pc.clone();
-        let sender = signal.sender();
+        let outbox = outbox.clone();
         let route = route.clone();
         tokio::spawn(async move {
             let mut disconnected: Option<tokio::time::Instant> = None;
@@ -303,6 +408,11 @@ async fn create_peer(
                     RTCPeerConnectionState::Disconnected => {
                         let now = tokio::time::Instant::now();
                         let since = *disconnected.get_or_insert(now);
+                        // A signaling outage must not consume the three restart
+                        // attempts on offers nobody can deliver.
+                        if !outbox.is_connected() {
+                            continue;
+                        }
                         if now.duration_since(since) >= Duration::from_secs(4)
                             && restart_attempts < 3
                         {
@@ -312,7 +422,7 @@ async fn create_peer(
                                     tracing::info!(
                                         "network switch: sending ICE restart offer (attempt {restart_attempts})"
                                     );
-                                    sender.soac(json!({
+                                    outbox.soac(json!({
                                         "client_id": route.client,
                                         "data": {
                                             "type": "offer",
@@ -372,10 +482,10 @@ async fn create_peer(
         })
     }));
 
-    let sender = signal.sender();
+    let outbox_for_candidates = outbox.clone();
     let signal_route = route.clone();
     pc.on_ice_candidate(Box::new(move |candidate| {
-        let sender = sender.clone();
+        let outbox = outbox_for_candidates.clone();
         let route = signal_route.clone();
         Box::pin(async move {
             let Some(candidate) = candidate else {
@@ -384,7 +494,7 @@ async fn create_peer(
             let Some(value) = rtc::candidate_json(&candidate) else {
                 return;
             };
-            sender.soac(json!({
+            outbox.soac(json!({
                 "client_id": route.client,
                 "data": {
                     "type": "candidate",
@@ -403,7 +513,7 @@ async fn create_peer(
             pc.clone(),
             track,
             desktop.clone(),
-            signal.sender(),
+            outbox.clone(),
             route.client.clone(),
             route.ice.clone(),
             route.app.clone(),
@@ -1738,7 +1848,7 @@ fn install_host_channels(
 
 async fn handle_soac(
     manager: &SessionManager,
-    signal: &Signal,
+    outbox: &Outbox,
     peers: &mut HashMap<String, HostPeer>,
     pending: &mut Vec<Pending>,
     data: &Value,
@@ -1786,7 +1896,7 @@ async fn handle_soac(
                 if let Ok(offer) = rtc::answer_sdp(body) {
                     if let Ok(answer) = peer.answer(&offer).await {
                         tracing::info!("native UU re-sent answer for ice={}", peer.route.ice);
-                        signal.soac(json!({
+                        outbox.soac(json!({
                             "client_id": peer.route.client,
                             "data": {
                                 "type": "answer",
@@ -1828,9 +1938,13 @@ async fn handle_soac(
             } else {
                 None
             };
+            if matches!(capture_type, 1 | 2) && desktop.is_none() {
+                tracing::warn!("native UU desktop offer without a usable capture; rejecting peer");
+                return;
+            }
             match create_peer(
                 manager,
-                signal,
+                outbox,
                 route.clone(),
                 &header,
                 desktop,
@@ -1850,7 +1964,7 @@ async fn handle_soac(
                                         "native UU answer sent for ice={}",
                                         peer.route.ice
                                     );
-                                    signal.soac(json!({
+                                    outbox.soac(json!({
                                         "client_id": peer.route.client,
                                         "data": {
                                             "type": "answer",

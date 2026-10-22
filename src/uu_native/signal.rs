@@ -63,9 +63,94 @@ impl Sender {
     }
 }
 
+/// Reconnect-aware outbound signaling. Peers keep one handle for their whole
+/// life; a room reconnect swaps the underlying `Sender` instead of tearing
+/// WebRTC peers down. While no room is connected, sends are dropped.
+#[derive(Clone)]
+pub struct Outbox {
+    inner: std::sync::Arc<std::sync::Mutex<Option<Sender>>>,
+    connected: tokio::sync::watch::Sender<bool>,
+}
+
+impl Outbox {
+    pub fn new() -> Self {
+        let (connected, _) = tokio::sync::watch::channel(false);
+        Self {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            connected,
+        }
+    }
+
+    pub fn attach(&self, sender: Sender) {
+        if let Ok(mut slot) = self.inner.lock() {
+            *slot = Some(sender);
+        }
+        self.connected.send_replace(true);
+    }
+
+    pub fn detach(&self) {
+        if let Ok(mut slot) = self.inner.lock() {
+            *slot = None;
+        }
+        self.connected.send_replace(false);
+    }
+
+    pub fn is_connected(&self) -> bool {
+        *self.connected.borrow()
+    }
+
+    pub fn state(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.connected.subscribe()
+    }
+
+    fn with(&self, send: impl FnOnce(&Sender)) {
+        let sender = self.inner.lock().ok().and_then(|slot| slot.clone());
+        if let Some(sender) = sender {
+            send(&sender);
+        }
+    }
+
+    pub fn text(&self, text: String) {
+        self.with(|sender| sender.text(text));
+    }
+
+    pub fn binary(&self, data: Vec<u8>) {
+        self.with(|sender| sender.binary(data));
+    }
+
+    pub fn event(&self, name: &str, payload: Value) {
+        self.with(|sender| sender.event(name, payload));
+    }
+
+    pub fn soac(&self, payload: Value) {
+        self.with(|sender| sender.soac(payload));
+    }
+
+    pub fn control(&self, ack_id: u64, header: Value, attachment: Vec<u8>) {
+        self.with(|sender| sender.control(ack_id, header, attachment));
+    }
+}
+
+impl Default for Outbox {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct Signal {
     tx: mpsc::UnboundedSender<Message>,
     rx: mpsc::Receiver<Event>,
+    writer: tokio::task::JoinHandle<()>,
+    reader: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Signal {
+    fn drop(&mut self) {
+        // A half-open socket must not keep a writer or reader task alive after
+        // the room is replaced.
+        self.writer.abort();
+        self.reader.abort();
+    }
 }
 
 impl Signal {
@@ -129,6 +214,10 @@ impl Signal {
                 .map_err(|e| format!("signaling connect failed: {e}"))?;
 
         let mut opened = false;
+        // Engine.IO open packet: `0{"pingInterval":25000,"pingTimeout":20000}`.
+        // The server closes the socket when a ping is missed for longer than
+        // both values; use it to detect half-open TCP after suspend/NAT loss.
+        let mut ping_window = Duration::from_secs(45);
         for _ in 0..12 {
             let message = tokio::time::timeout(CONNECT_TIMEOUT, ws.next())
                 .await
@@ -138,6 +227,11 @@ impl Signal {
             match message {
                 Message::Text(text) if text.starts_with('0') => {
                     opened = true;
+                    if let Ok(open) = serde_json::from_str::<Value>(&text[1..]) {
+                        if let Some(window) = heartbeat_window(&open) {
+                            ping_window = window;
+                        }
+                    }
                     ws.send(Message::Text("40".into()))
                         .await
                         .map_err(|e| e.to_string())?;
@@ -169,7 +263,7 @@ impl Signal {
         let (mut writer, mut reader) = ws.split();
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
         let (event_tx, event_rx) = mpsc::channel::<Event>(256);
-        tokio::spawn(async move {
+        let writer_task = tokio::spawn(async move {
             while let Some(message) = out_rx.recv().await {
                 if writer.send(message).await.is_err() {
                     break;
@@ -177,8 +271,10 @@ impl Signal {
             }
         });
         let tx = out_tx.clone();
-        tokio::spawn(async move {
+        let reader_task = tokio::spawn(async move {
             let mut pending: Option<(String, Value, usize, Vec<Vec<u8>>)> = None;
+            let heartbeat = ping_window + Duration::from_secs(5);
+            let mut deadline = tokio::time::Instant::now() + heartbeat;
             // The official controlled session refreshes its reconnect key every
             // 30s (first refresh 30s after the socket.io namespace connects).
             // Without it the server closes the namespace after about 30s, which
@@ -187,6 +283,12 @@ impl Signal {
             let mut refresh_id: u64 = 1000;
             loop {
                 let message = tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => {
+                        let _ = event_tx
+                            .send(Event::Closed("signaling heartbeat timed out".into()))
+                            .await;
+                        break;
+                    }
                     _ = tokio::time::sleep_until(next_refresh) => {
                         refresh_id += 1;
                         let packet = format!("42{refresh_id}[\"refresh_reconnect_key\"]");
@@ -200,6 +302,7 @@ impl Signal {
                     }
                     message = reader.next() => message,
                 };
+                deadline = tokio::time::Instant::now() + heartbeat;
                 let Some(message) = message else { break };
                 let message = match message {
                     Ok(message) => message,
@@ -286,7 +389,12 @@ impl Signal {
                 }
             }
         });
-        Ok(Self { tx, rx: event_rx })
+        Ok(Self {
+            tx,
+            rx: event_rx,
+            writer: writer_task,
+            reader: reader_task,
+        })
     }
 
     pub fn sender(&self) -> Sender {
@@ -321,6 +429,17 @@ impl Signal {
         self.send_text(packet);
         self.send_binary(attachment);
     }
+}
+
+/// Socket.IO ping budget from the Engine.IO open packet, clamped to a sane
+/// range so a broken server cannot disable or shorten liveness detection.
+fn heartbeat_window(open: &Value) -> Option<Duration> {
+    let interval = open.get("pingInterval").and_then(Value::as_u64)?;
+    let timeout = open.get("pingTimeout").and_then(Value::as_u64)?;
+    Some(
+        Duration::from_millis(interval.saturating_add(timeout))
+            .clamp(Duration::from_secs(5), Duration::from_secs(300)),
+    )
 }
 
 fn parse_event(body: &str) -> Option<(String, Value)> {
@@ -396,5 +515,41 @@ mod tests {
         let header = serde_json::json!({"data":{"_placeholder":true,"num":0}});
         let value = fill_placeholders(header, &[b"abc".to_vec()]);
         assert_eq!(value["data"], "YWJj");
+    }
+
+    #[test]
+    fn heartbeat_window_follows_the_open_packet_and_is_clamped() {
+        assert_eq!(
+            heartbeat_window(&serde_json::json!({"pingInterval":25000,"pingTimeout":20000})),
+            Some(Duration::from_secs(45))
+        );
+        assert_eq!(
+            heartbeat_window(&serde_json::json!({"pingInterval":100,"pingTimeout":100})),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            heartbeat_window(&serde_json::json!({"pingInterval":200000,"pingTimeout":200000})),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(heartbeat_window(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn outbox_forwards_only_while_a_room_is_attached() {
+        let outbox = Outbox::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert!(!outbox.is_connected());
+        outbox.attach(Sender { tx });
+        assert!(outbox.is_connected());
+        outbox.soac(serde_json::json!({"type":"candidate"}));
+        let message = rx.try_recv().expect("attached outbox forwards");
+        match message {
+            Message::Text(text) => assert!(text.starts_with("42[\"soac\"")),
+            other => panic!("unexpected message: {other:?}"),
+        }
+        outbox.detach();
+        assert!(!outbox.is_connected());
+        outbox.soac(serde_json::json!({"type":"candidate"}));
+        assert!(rx.try_recv().is_err(), "detached outbox drops sends");
     }
 }

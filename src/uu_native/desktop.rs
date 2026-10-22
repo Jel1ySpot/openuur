@@ -1,6 +1,6 @@
 //! Native UU desktop stream: video/audio tracks and portal input wiring.
 
-use super::signal::Sender;
+use super::signal::Outbox;
 use super::video_settings::{self, VideoSettings};
 use crate::desktop::encoder::{Encoder, EncoderConfig};
 use crate::desktop::video_track::{Codec, VideoTrack};
@@ -36,7 +36,7 @@ pub fn spawn(
     pc: Arc<RTCPeerConnection>,
     track: Arc<VideoTrack>,
     desktop: Arc<DesktopSession>,
-    sender: Sender,
+    outbox: Outbox,
     client_id: String,
     ice_id: String,
     app_id: String,
@@ -65,7 +65,7 @@ pub fn spawn(
             return;
         };
         announce(
-            &sender, &client_id, &ice_id, &app_id, &desktop, &track, current,
+            &outbox, &client_id, &ice_id, &app_id, &desktop, &track, current,
         );
         let mut encoder: Option<Encoder> = None;
         let mut force_cpu = false;
@@ -173,7 +173,7 @@ pub fn spawn(
                         encoder = Some(started);
                         current = next;
                         announce(
-                            &sender, &client_id, &ice_id, &app_id, &desktop, &track, current,
+                            &outbox, &client_id, &ice_id, &app_id, &desktop, &track, current,
                         );
                     }
                     Err(error) => {
@@ -262,7 +262,7 @@ async fn wait_connected(pc: &Arc<RTCPeerConnection>) -> bool {
 }
 
 fn announce(
-    sender: &Sender,
+    outbox: &Outbox,
     client_id: &str,
     ice_id: &str,
     app_id: &str,
@@ -280,7 +280,7 @@ fn announce(
     );
     let full_chroma =
         crate::desktop::encoder::full_chroma_available(crate::desktop::encoder::detect_kind());
-    sender.event(
+    outbox.event(
         "forward_setting",
         serde_json::json!({
             "client_id": client_id,
@@ -299,7 +299,7 @@ fn announce(
             }
         }),
     );
-    sender.event(
+    outbox.event(
         "forward_setting",
         serde_json::json!({
             "client_id": client_id,
@@ -319,7 +319,7 @@ fn announce(
             }
         }),
     );
-    sender.event(
+    outbox.event(
         "ice_finished_log",
         serde_json::json!({"ice_id": ice_id, "app_control_id": app_id}),
     );
