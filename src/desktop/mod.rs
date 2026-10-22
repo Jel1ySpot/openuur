@@ -17,6 +17,7 @@ pub mod encoder;
 pub mod hevc;
 pub mod portal_permissions;
 pub mod session_lock;
+pub mod session_power;
 pub mod video_track;
 pub mod virtual_audio;
 pub use encoder::FPS;
@@ -264,6 +265,13 @@ impl DesktopSession {
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Release);
         self.task.abort();
+    }
+
+    /// Wake the display using this session's backend.
+    pub async fn wake(&self) {
+        if let Err(error) = desktop_power::wake_backend(self.backend).await {
+            tracing::debug!("desktop wake failed: {error}");
+        }
     }
 }
 

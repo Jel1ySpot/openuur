@@ -220,13 +220,6 @@ pub async fn start(options: DesktopOptions) -> Result<DesktopSession, String> {
     ));
     let first = open(&options, clipboard_manager.as_ref(), &persistence).await?;
     let _ = super::desktop_power::wake().await;
-    let inhibitor = match super::desktop_power::IdleInhibitor::acquire().await {
-        Ok(inhibitor) => Some(inhibitor),
-        Err(error) => {
-            tracing::warn!("desktop idle inhibition unavailable: {error}");
-            None
-        }
-    };
     let screens = first.screens.clone();
     let active = screens.first().map(|screen| screen.id).unwrap_or(0);
     let input_target = first.active_target();
@@ -241,6 +234,9 @@ pub async fn start(options: DesktopOptions) -> Result<DesktopSession, String> {
     ));
     let shared_session: SharedSession = Arc::new(RwLock::new(Some(first.handle.clone())));
     let locked = super::session_lock::watch_locked();
+    // The logind inhibitor is owned by the host peers, not by this capture
+    // session; the watch only tells capture/input to pause while suspended.
+    let power = super::session_power::RemoteSessionPower::subscribe();
     let clipboard = clipboard_manager.as_ref().map(|manager| {
         super::clipboard::start_portal(manager.clone(), shared_session.clone(), locked.clone())
     });
@@ -256,7 +252,7 @@ pub async fn start(options: DesktopOptions) -> Result<DesktopSession, String> {
         clipboard_manager,
         shared_session,
         locked,
-        inhibitor,
+        power,
         persistence,
     ));
     Ok(DesktopSession {
@@ -280,13 +276,14 @@ async fn supervise(
     clipboard: Option<Arc<ClipboardManager>>,
     shared_session: SharedSession,
     mut locked: watch::Receiver<Option<bool>>,
-    _inhibitor: Option<super::desktop_power::IdleInhibitor>,
+    mut power: watch::Receiver<bool>,
     persistence: Arc<AtomicBool>,
 ) {
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(5));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_transform = HashMap::<u32, Option<u32>>::new();
     let mut wheel = super::uinput_scroll::WheelBackend::default();
+    let mut reopen_pending = false;
     let (closed_tx, mut closed_rx) = mpsc::channel::<()>(1);
     spawn_closed_watcher(&current.handle, closed_tx.clone());
     loop {
@@ -296,6 +293,12 @@ async fn supervise(
         let mut reopen = false;
         tokio::select! {
             _ = tick.tick() => {
+                if *power.borrow() {
+                    // Drain so the compositor queue cannot back up, and do not
+                    // publish stale frames while the machine is suspended.
+                    while current.pipewire.try_recv_frame().is_some() {}
+                    continue;
+                }
                 while let Some(frame) = current.pipewire.try_recv_frame() {
                     let Some(screen) = current.screens.iter().find(|screen| screen.id == frame.monitor_index) else { continue; };
                     if frame.width != screen.width || frame.height != screen.height {
@@ -323,7 +326,7 @@ async fn supervise(
             }
             event = input_rx.recv() => {
                 let Some(mut event) = event else { break; };
-                if *locked.borrow() != Some(false) {
+                if *power.borrow() || *locked.borrow() != Some(false) {
                     continue;
                 }
                 // Coalesce queued pointer motion so D-Bus calls cannot build a backlog.
@@ -370,8 +373,28 @@ async fn supervise(
                     reopen = true;
                 }
             }
+            changed = power.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                if *power.borrow() {
+                    tracing::info!("system suspending; pausing desktop capture");
+                    state.clear_frame();
+                } else {
+                    tracing::info!("system resumed; resuming desktop capture");
+                    // Frame transforms and portal sizing may have changed
+                    // while the machine was asleep.
+                    last_transform.clear();
+                }
+            }
         }
         if reopen {
+            // A portal reopen can prompt the user; defer it until the machine
+            // is awake, but remember the request.
+            reopen_pending = true;
+        }
+        if reopen_pending && !*power.borrow() {
+            reopen_pending = false;
             if let Err(error) = recover(
                 &mut current,
                 &state,
@@ -380,6 +403,7 @@ async fn supervise(
                 clipboard.as_ref(),
                 &shared_session,
                 &mut locked,
+                &mut power,
                 &closed_tx,
                 &persistence,
             )
@@ -415,14 +439,24 @@ async fn recover(
     clipboard: Option<&Arc<ClipboardManager>>,
     shared_session: &SharedSession,
     locked: &mut watch::Receiver<Option<bool>>,
+    power: &mut watch::Receiver<bool>,
     closed_tx: &mpsc::Sender<()>,
     persistence: &AtomicBool,
 ) -> Result<(), String> {
     // Do not prompt or reopen while the session is locked. GNOME reopens the
     // session with the persisted token after unlock.
-    while !stop.load(Ordering::Acquire) && *locked.borrow() != Some(false) {
-        if locked.changed().await.is_err() {
-            return Err("lock watcher stopped".to_owned());
+    while !stop.load(Ordering::Acquire) && (*power.borrow() || *locked.borrow() != Some(false)) {
+        tokio::select! {
+            changed = power.changed() => {
+                if changed.is_err() {
+                    return Err("power watcher stopped".to_owned());
+                }
+            }
+            changed = locked.changed() => {
+                if changed.is_err() {
+                    return Err("lock watcher stopped".to_owned());
+                }
+            }
         }
     }
     let _ = current.pipewire.shutdown();
@@ -431,6 +465,12 @@ async fn recover(
     loop {
         if stop.load(Ordering::Acquire) {
             return Err("desktop stopped".to_owned());
+        }
+        if *power.borrow() {
+            if power.changed().await.is_err() {
+                return Err("power watcher stopped".to_owned());
+            }
+            continue;
         }
         loop {
             if stop.load(Ordering::Acquire) {

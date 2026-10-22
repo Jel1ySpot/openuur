@@ -61,6 +61,10 @@ struct HostPeer {
     desktop: Option<Arc<DesktopSession>>,
     actions: Arc<PeerActions>,
     stopped: AtomicBool,
+    /// One reference on the process-wide sleep inhibitor. Released by normal
+    /// struct drop on every removal path; it tracks peer lifetime rather than
+    /// WebRTC connection state, so `finish` leaves it alone.
+    _power: crate::desktop::session_power::RemoteSessionPowerGuard,
 }
 
 impl HostPeer {
@@ -522,6 +526,7 @@ async fn create_peer(
         desktop,
         actions,
         stopped: AtomicBool::new(false),
+        _power: crate::desktop::session_power::RemoteSessionPower::acquire(),
     })
 }
 
@@ -1941,27 +1946,38 @@ async fn handle_soac(
             {
                 Ok(peer) => {
                     peers.insert(route.ice.clone(), peer);
-                    if let Some(peer) = peers.get(&route.ice) {
+                    let answered = {
+                        let Some(peer) = peers.get(&route.ice) else {
+                            return;
+                        };
                         match rtc::answer_sdp(body) {
-                            Ok(offer) => match peer.answer(&offer).await {
-                                Ok(answer) => {
-                                    tracing::info!(
-                                        "native UU answer sent for ice={}",
-                                        peer.route.ice
-                                    );
-                                    outbox.soac(json!({
-                                        "client_id": peer.route.client,
-                                        "data": {
-                                            "type": "answer",
-                                            "sdp": answer,
-                                            "ice_id": peer.route.ice,
-                                            "app_control_id": peer.route.app,
-                                        }
-                                    }))
-                                }
-                                Err(error) => tracing::warn!("native UU answer failed: {error}"),
-                            },
-                            Err(error) => tracing::warn!("native UU offer decode failed: {error}"),
+                            Ok(offer) => peer.answer(&offer).await,
+                            Err(error) => Err(Error::Protocol(error)),
+                        }
+                    };
+                    match answered {
+                        Ok(answer) => {
+                            if let Some(peer) = peers.get(&route.ice) {
+                                tracing::info!("native UU answer sent for ice={}", peer.route.ice);
+                                outbox.soac(json!({
+                                    "client_id": peer.route.client,
+                                    "data": {
+                                        "type": "answer",
+                                        "sdp": answer,
+                                        "ice_id": peer.route.ice,
+                                        "app_control_id": peer.route.app,
+                                    }
+                                }))
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!("native UU answer failed: {error}");
+                            // A peer that never received an answer stays in
+                            // `New` forever, pinning its capture and the
+                            // process-wide sleep inhibitor.
+                            if let Some(peer) = peers.remove(&route.ice) {
+                                peer.close().await;
+                            }
                         }
                     }
                 }

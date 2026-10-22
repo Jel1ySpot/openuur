@@ -296,6 +296,7 @@ target/release/openuurd
 | 系统音频 | Opus 128k，`UU_AUDIO=0` 关闭，`UU_AUDIO_SOURCE` 指定 source |
 | 静音运行 | null sink + monitor：本机扬声器静音，控制端仍能听到声音；会话结束恢复 |
 | 锁屏状态/自动解锁 | logind `LockedHint` + PAM；锁屏时发送合成黑帧，官方客户端可进入自动解锁 |
+| 休眠抑制/唤醒 | 有远端 peer 时持有 logind `sleep:idle` block 抑制器，最后一个 peer 断开即释放；`UU_PREVENT_SLEEP=0` 关闭；系统 `PrepareForSleep` 时暂停采集与输入，恢复后唤醒显示器 |
 | 系统操作 | 锁屏、显示桌面、任务管理器、重启、关机 |
 | 文本剪贴板 | GNOME/KDE portal、KDE Klipper、wl-clipboard；聚焦时重读 |
 | 文件传输 | 浏览/上传/下载/改名/删除、压缩目录、续传、跳过/覆盖/重名 |
