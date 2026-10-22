@@ -2,7 +2,8 @@
 //!
 //! The host only depends on the contracts in this module. Wayland is
 //! implemented with xdg-desktop-portal ScreenCast + RemoteDesktop and
-//! PipeWire; an X11 backend can implement the same contract later.
+//! PipeWire; the X11 backend implements the same contract with XDamage,
+//! MIT-SHM and XTest.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
@@ -14,6 +15,7 @@ use session_env::{DesktopKind, SessionEnv, SessionType};
 pub mod apps;
 pub mod audio;
 pub mod clipboard;
+pub mod cursor;
 pub mod desktop_power;
 pub mod encoder;
 pub mod hevc;
@@ -60,11 +62,16 @@ impl Backend {
         }
     }
 
-    /// Whether this build can actually capture with the backend today. X11
-    /// and native wlroots land in later phases; selecting them still reports
-    /// the intended backend, but desktop offers are rejected until then.
+    /// Whether this build can actually capture with the backend today. The
+    /// native wlroots backend lands in a later phase; selecting it still
+    /// reports the intended backend, but desktop offers are rejected until
+    /// then.
     pub fn implemented(self) -> bool {
-        matches!(self, Self::Wayland)
+        match self {
+            Self::Wayland => cfg!(all(target_os = "linux", feature = "desktop")),
+            Self::X11 => cfg!(all(target_os = "linux", feature = "desktop")),
+            Self::Wlroots => false,
+        }
     }
 }
 
@@ -223,6 +230,19 @@ pub struct ScreenInfo {
     pub primary: bool,
 }
 
+/// One pointer image from a backend that can observe the hardware cursor.
+/// Only the X11 backend produces these today; Wayland has no global cursor.
+#[derive(Clone, Debug)]
+pub struct CursorImage {
+    pub serial: u32,
+    pub width: u16,
+    pub height: u16,
+    pub xhot: u16,
+    pub yhot: u16,
+    /// Premultiplied ARGB, row-major, X11 bit order (`0xAARRGGBB`).
+    pub argb: Arc<Vec<u32>>,
+}
+
 /// A desktop input backend. Calls enqueue events and return immediately.
 pub trait InputSink: Send + Sync {
     fn pointer_absolute(&self, x: f64, y: f64);
@@ -318,12 +338,26 @@ impl DesktopState {
             .map(|screens| screens.clone())
             .unwrap_or_default()
     }
+
+    /// The active screen's rectangle, if the backend published one.
+    pub(crate) fn active_screen(&self) -> Option<ScreenInfo> {
+        let active = self.active.load(Ordering::Acquire);
+        self.screens()
+            .into_iter()
+            .find(|screen| screen.id == active)
+    }
+
+    /// The active screen id (0 when the backend published no screens).
+    pub(crate) fn active_id(&self) -> u32 {
+        self.active.load(Ordering::Acquire)
+    }
 }
 
 pub struct DesktopSession {
     pub backend: Backend,
     state: Arc<DesktopState>,
     frames: watch::Receiver<Option<CapturedFrame>>,
+    cursor: watch::Receiver<Option<CursorImage>>,
     input: Arc<dyn InputSink>,
     stop: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
@@ -333,6 +367,16 @@ pub struct DesktopSession {
 impl DesktopSession {
     pub fn latest_frame(&self) -> Option<CapturedFrame> {
         self.frames.borrow().clone()
+    }
+
+    /// Subscribe to frame updates instead of polling `latest_frame`.
+    pub fn frames(&self) -> watch::Receiver<Option<CapturedFrame>> {
+        self.frames.clone()
+    }
+
+    /// Pointer shapes, when the backend can observe them (X11 only).
+    pub fn cursor(&self) -> watch::Receiver<Option<CursorImage>> {
+        self.cursor.clone()
     }
 
     pub fn input(&self) -> Arc<dyn InputSink> {
@@ -410,7 +454,7 @@ impl Drop for DesktopSession {
     }
 }
 
-/// Open the native desktop with default options. X11 is a deliberate stub.
+/// Open the native desktop with default options.
 pub async fn start(
     backend: Backend,
     restore_token: Option<String>,
@@ -445,7 +489,7 @@ pub async fn start_with(
             )
         }
         #[cfg(target_os = "linux")]
-        Backend::X11 => x11::start().await,
+        Backend::X11 => x11::start(options).await,
         #[cfg(not(target_os = "linux"))]
         _ => unsupported::start().await,
     }

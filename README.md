@@ -6,7 +6,7 @@
 
 ### 1. 安装二进制
 
-`cargo install` 可以安装到 `~/.cargo/bin`。默认构建包含 Wayland 桌面采集，需要 PipeWire/SPA 开发头文件和 libclang：
+`cargo install` 可以安装到 `~/.cargo/bin`。默认构建包含 Wayland portal 与 X11 桌面采集，需要 PipeWire/SPA 开发头文件和 libclang：
 
 ```bash
 # Debian / Ubuntu
@@ -54,7 +54,7 @@ openuur install          # 用户级 systemd 服务
 运行时依赖：
 
 - `ffmpeg`：视频编码
-- `xdg-desktop-portal` 及对应桌面后端（`xdg-desktop-portal-gnome` / `xdg-desktop-portal-kde` / `xdg-desktop-portal-wlr`）：屏幕采集与远程输入
+- `xdg-desktop-portal` 及对应桌面后端（`xdg-desktop-portal-gnome` / `xdg-desktop-portal-kde` / `xdg-desktop-portal-wlr`）：Wayland 屏幕采集与远程输入（X11 会话直接使用 X 协议，不需要 portal）
 - `libpam`：锁屏自动解锁
 - `wireplumber`：提供 `wpctl`，用于静音运行
 - `wl-clipboard`：文本剪贴板
@@ -156,7 +156,7 @@ openuurd run
 openuurd run --password 'your-password'
 ```
 
-远程桌面要求 `openuurd` 运行在**已登录的 Wayland 图形会话**中（有 `WAYLAND_DISPLAY`、`XDG_RUNTIME_DIR`、`DBUS_SESSION_BUS_ADDRESS`）。第一次接受远程桌面时，xdg-desktop-portal 会弹出屏幕共享 + 远程输入授权；是否记住授权由桌面后端决定。不要以 root 或普通 system service 运行它，否则打不开 portal。
+远程桌面要求 `openuurd` 能找到该账号**已登录的图形会话**：Wayland 会话通过 xdg-desktop-portal（首次连接会弹出屏幕共享 + 远程输入授权；系统服务会通过 logind 投影 `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`/session bus），X11 会话直接使用 XDamage/XTest（不需要 portal）。在没有图形会话的 greeter 阶段仍只提供终端。
 
 `--no-online` 只生成/显示本地设备身份，不连接 UU 信令：
 
@@ -273,7 +273,7 @@ nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#pkg-config nixpkgs#openssl \
 cargo build --release --no-default-features
 ```
 
-运行时还需要 `ffmpeg`（含 `libx264`）、`xdg-desktop-portal` 和对应桌面后端（KDE/GNOME/wlroots）。
+运行时还需要 `ffmpeg`（含 `libx264`）；Wayland 会话还需要 `xdg-desktop-portal` 和对应桌面后端（KDE/GNOME/wlroots），X11 会话不需要。
 
 产物：
 
@@ -287,7 +287,8 @@ target/release/openuurd
 | 功能 | 说明 |
 |---|---|
 | 多显示器 | portal 一次授权多个 monitor；官方客户端通过 `CaptureConfig.screen_id` 切换 |
-| 采集后端 | `openuurd run --desktop-backend auto\|portal\|wlroots\|x11`、`UU_DESKTOP_BACKEND`；auto 按会话类型选择（GNOME/KDE Wayland → portal，其它 Wayland → wlroots，X11 → x11）；原生 wlroots 与 X11 后端尚未落地，auto 选中 wlroots 时暂用 portal，X11 桌面请求会明确拒绝 |
+| 采集后端 | `openuurd run --desktop-backend auto\|portal\|wlroots\|x11`、`UU_DESKTOP_BACKEND`；auto 按会话类型选择（GNOME/KDE Wayland → portal，其它 Wayland → wlroots，X11 → x11）；原生 wlroots 尚未落地，auto 选中 wlroots 时暂用 portal |
+| X11 后端 | XDamage + MIT-SHM 采集（缺 DAMAGE/SHM 时退化轮询或 `GetImage`）、XTest 绝对/相对指针与按键、120 单位滚轮、临时 keycode 文本输入、XFixes 光标形状采集、RandR 活动显示器切换；窗口/虚拟源仍请使用 portal；X11 会话暂不支持文本剪贴板 |
 | 会话发现 | 系统服务通过 logind 找到账号的活动图形会话，投影 `WAYLAND_DISPLAY`/`DISPLAY`/`XDG_RUNTIME_DIR`/session bus 等 7 个变量；每 2 秒复查，会话切换只断开桌面 peer，终端/文件/端口映射保留；没有会话时明确报「等待图形会话」 |
 | 显示源 | `openuurd display source monitor\|window\|virtual`，或 `openuurd run --display-source ...` / `UU_DISPLAY_SOURCE` |
 | 分辨率 | 编码器缩放，不修改宿主机显示模式；显示配置变化时重建采集并保留编码尺寸 |

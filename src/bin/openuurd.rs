@@ -7,8 +7,8 @@ use std::path::PathBuf;
 #[command(
     name = "openuurd",
     version,
-    about = "UU Remote native terminal and Wayland desktop host",
-    long_about = "openuurd keeps this device online through UU signaling and serves its terminal and Wayland desktop to official UU controllers and openuur clients over the native WebRTC protocol."
+    about = "UU Remote native terminal and desktop host",
+    long_about = "openuurd keeps this device online through UU signaling and serves its terminal and graphical desktop to official UU controllers and openuur clients over the native WebRTC protocol."
 )]
 struct Cli {
     #[arg(long, global = true, env = "OPENUUR_CONFIG")]
@@ -21,7 +21,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Put this device online and serve terminal and Wayland desktop sessions.
+    /// Put this device online and serve terminal and graphical desktop sessions.
     Run(RunArgs),
     /// Show the locally configured identity without printing the token.
     Status,
@@ -130,7 +130,10 @@ async fn real_main() -> anyhow::Result<()> {
             match openuur::desktop::detect_backend_selection(config.desktop_backend()).await {
                 Ok((selection, session)) => {
                     println!("desktop session: {}", session.describe());
-                    println!("desktop capture: {}", capture_line(selection));
+                    println!(
+                        "desktop capture: {}",
+                        capture_line(selection, config.display_source())
+                    );
                 }
                 Err(error) => println!("desktop capture: unavailable ({error})"),
             }
@@ -146,7 +149,10 @@ async fn real_main() -> anyhow::Result<()> {
             match openuur::desktop::detect_backend_selection(config.desktop_backend()).await {
                 Ok((selection, session)) => {
                     println!("desktop session: {}", session.describe());
-                    println!("desktop capture: {}", capture_line(selection));
+                    println!(
+                        "desktop capture: {}",
+                        capture_line(selection, config.display_source())
+                    );
                 }
                 Err(error) => {
                     println!("desktop session: {error}");
@@ -183,18 +189,28 @@ async fn real_main() -> anyhow::Result<()> {
 }
 
 /// One line that never presents an unimplemented backend as usable.
-fn capture_line(selection: openuur::desktop::BackendSelection) -> String {
+fn capture_line(
+    selection: openuur::desktop::BackendSelection,
+    source: openuur::desktop::SourceKind,
+) -> String {
     let backend = selection.effective.label();
     if !selection.effective.implemented() {
         return format!("{backend} (backend not implemented yet; desktop offers will be rejected)");
     }
-    if selection.fallback {
-        return format!(
+    let mut line = if selection.fallback {
+        format!(
             "{backend} ({} requested; native backend not implemented)",
             selection.requested.label()
-        );
+        )
+    } else {
+        backend.to_owned()
+    };
+    if selection.effective == openuur::desktop::Backend::X11
+        && source != openuur::desktop::SourceKind::Monitor
+    {
+        line.push_str(" (X11 captures a whole monitor; window/virtual need portal)");
     }
-    backend.to_owned()
+    line
 }
 
 fn init_logging(verbose: bool) {

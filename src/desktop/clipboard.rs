@@ -47,7 +47,11 @@ pub fn start() -> ClipboardBridge {
     if command_exists("qdbus") && qdbus_clipboard_works() {
         return start_qdbus();
     }
-    if command_exists("wl-copy") && command_exists("wl-paste") {
+    // wl-copy/wl-paste are useless without a Wayland compositor, and claiming
+    // the capability on X11 would make the host advertise a clipboard it
+    // cannot serve.
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty());
+    if wayland && command_exists("wl-copy") && command_exists("wl-paste") {
         return start_wl();
     }
     unavailable()

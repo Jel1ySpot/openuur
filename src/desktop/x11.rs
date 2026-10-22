@@ -1,11 +1,251 @@
-//! X11 wake support and the placeholder for the future capture backend.
+//! Native X11 capture, input and cursor tracking.
 //!
-//! Display wake needs only DPMS and XTest, so it is available even though the
-//! X11 capture backend is still a stub. X11 capture can later implement the
-//! same `DesktopSession`/`InputSink` contract using XShm/XTest.
+//! Capture uses RandR for the monitor inventory, XDamage for change
+//! notification and MIT-SHM for the pixel transfer, falling back to core
+//! `GetImage` when the extension is missing. Input goes through XTest on its
+//! own connection so a slow capture never delays the pointer. Cursor shapes
+//! come from XFixes on a third connection.
+//!
+//! Wayland-adjacent details follow `wayland.rs`: absolute pointer positions
+//! are normalized, the session lock and system suspend pause capture and
+//! input, and only the active monitor is encoded.
 
-pub async fn start() -> Result<super::DesktopSession, String> {
-    Err("X11 desktop capture is not implemented yet; use Wayland for now".to_owned())
+#[cfg(feature = "desktop")]
+mod capture;
+#[cfg(feature = "desktop")]
+mod cursor;
+#[cfg(feature = "desktop")]
+mod input;
+
+use super::{DesktopOptions, DesktopSession};
+
+#[cfg(feature = "desktop")]
+use std::sync::atomic::AtomicBool;
+#[cfg(feature = "desktop")]
+use std::sync::{Arc, Mutex};
+#[cfg(feature = "desktop")]
+use tokio::sync::watch;
+
+#[cfg(feature = "desktop")]
+use super::{DesktopState, ScreenInfo, SourceKind};
+
+#[cfg(feature = "desktop")]
+pub async fn start(options: DesktopOptions) -> Result<DesktopSession, String> {
+    start_at(None, options).await
+}
+
+#[cfg(not(feature = "desktop"))]
+pub async fn start(_options: DesktopOptions) -> Result<DesktopSession, String> {
+    Err("X11 desktop capture needs the `desktop` feature".to_owned())
+}
+
+/// Everything one connection can learn about the screen layout before the
+/// capture threads start.
+#[cfg(feature = "desktop")]
+pub(crate) struct Probe {
+    screens: Vec<ScreenInfo>,
+    active: u32,
+    shm: bool,
+    damage: bool,
+    randr: bool,
+}
+
+#[cfg(feature = "desktop")]
+pub(crate) async fn start_at(
+    display: Option<&str>,
+    options: DesktopOptions,
+) -> Result<DesktopSession, String> {
+    start_at_with(display, options, super::session_lock::watch_locked()).await
+}
+
+/// Start capture with an explicit lock-state receiver. `start_at` passes the
+/// session watcher; tests inject a fixed, unlocked state so a locked host
+/// session cannot pause the capture they are exercising.
+#[cfg(feature = "desktop")]
+pub(crate) async fn start_at_with(
+    display: Option<&str>,
+    options: DesktopOptions,
+    locked: watch::Receiver<Option<bool>>,
+) -> Result<DesktopSession, String> {
+    if options.source != SourceKind::Monitor {
+        return Err(
+            "the X11 backend captures a whole monitor; use --desktop-backend portal for \
+             window or virtual sources"
+                .to_owned(),
+        );
+    }
+    let display = display.map(str::to_owned);
+    let explicit_display = display.is_some();
+    let probe = {
+        let display = display.clone();
+        // A stalled display socket must not wedge session start-up. The
+        // blocking connect cannot be cancelled, but the caller fails fast.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || probe(display.as_deref())),
+        )
+        .await
+        .map_err(|_| "X11 server did not answer within 10 s".to_owned())?
+        .map_err(|error| format!("X11 probe task failed: {error}"))??
+    };
+    let (frames_tx, frames) = watch::channel(None);
+    let (generation_tx, _) = watch::channel(0u64);
+    let state = Arc::new(DesktopState::new(
+        probe.screens.clone(),
+        probe.active,
+        (0, 0, 0),
+        frames_tx,
+        generation_tx,
+    ));
+    let (cursor_tx, cursor) = watch::channel(None);
+    let stop = Arc::new(AtomicBool::new(false));
+    let input = input::start(display.clone(), state.clone(), stop.clone(), locked.clone()).await?;
+    capture::start(display.clone(), &probe, state.clone(), stop.clone(), locked).await?;
+    if let Err(error) = cursor::start(display, cursor_tx, stop.clone()) {
+        // Cursor shapes are a nice-to-have; capture and input still work.
+        tracing::warn!("X11 cursor tracking unavailable: {error}");
+    }
+    // Capture and input threads poll `stop`; this task only gives
+    // `DesktopSession::stop` something to abort.
+    let task = tokio::spawn(std::future::pending::<()>());
+    // An explicit display is a test or alternate server; waking through it is
+    // not the same as waking the ambient session.
+    if !explicit_display {
+        let _ = super::desktop_power::wake().await;
+    }
+    Ok(DesktopSession {
+        backend: super::Backend::X11,
+        state,
+        frames,
+        cursor,
+        input,
+        stop,
+        task,
+        clipboard: Mutex::new(None),
+    })
+}
+
+/// Probe the display server before starting threads.
+#[cfg(feature = "desktop")]
+fn probe(display: Option<&str>) -> Result<Probe, String> {
+    use x11rb::connection::Connection;
+    use x11rb::connection::RequestConnection as _;
+
+    let (connection, screen_num) =
+        x11rb::connect(display).map_err(|error| format!("X11 connection failed: {error}"))?;
+    let setup = connection.setup();
+    let screen = setup
+        .roots
+        .get(screen_num)
+        .ok_or_else(|| "X11 screen index out of range".to_owned())?;
+    let root = screen.root;
+
+    let xtest = connection
+        .extension_information("XTEST")
+        .map_err(|error| error.to_string())?
+        .is_some();
+    if !xtest {
+        return Err("the X11 server has no XTEST extension; remote input is impossible".to_owned());
+    }
+    if screen.root_depth != 24 && screen.root_depth != 32 {
+        return Err(format!(
+            "unsupported X11 root depth {}; only 24- and 32-bit TrueColor are supported",
+            screen.root_depth
+        ));
+    }
+    let bpp = setup
+        .pixmap_formats
+        .iter()
+        .find(|format| format.depth == screen.root_depth)
+        .map(|format| format.bits_per_pixel)
+        .unwrap_or(32);
+    if bpp != 32 {
+        return Err(format!(
+            "unsupported X11 pixel size {bpp}; only 32 bits per pixel is supported"
+        ));
+    }
+    if setup.image_byte_order != x11rb::protocol::xproto::ImageOrder::LSB_FIRST {
+        return Err("X11 MSB-first pixel order is not supported".to_owned());
+    }
+
+    let randr = connection
+        .extension_information("RANDR")
+        .map_err(|error| error.to_string())?
+        .is_some();
+    let damage = connection
+        .extension_information("DAMAGE")
+        .map_err(|error| error.to_string())?
+        .is_some();
+    let shm = connection
+        .extension_information("MIT-SHM")
+        .map_err(|error| error.to_string())?
+        .is_some();
+
+    let mut screens = Vec::new();
+    if randr {
+        if let Some(monitors) = randr_monitors(&connection, root) {
+            screens = monitors;
+        }
+    }
+    if screens.is_empty() {
+        screens.push(ScreenInfo {
+            id: 0,
+            node_id: 0,
+            x: 0,
+            y: 0,
+            width: u32::from(screen.width_in_pixels),
+            height: u32::from(screen.height_in_pixels),
+            primary: true,
+        });
+    }
+    let active = screens
+        .iter()
+        .find(|screen| screen.primary)
+        .or_else(|| screens.first())
+        .map(|screen| screen.id)
+        .unwrap_or(0);
+    Ok(Probe {
+        screens,
+        active,
+        shm,
+        damage,
+        randr,
+    })
+}
+
+/// RandR monitor rectangles in root coordinates.
+#[cfg(feature = "desktop")]
+pub(crate) fn randr_monitors(
+    connection: &impl x11rb::connection::Connection,
+    root: u32,
+) -> Option<Vec<ScreenInfo>> {
+    use x11rb::protocol::randr;
+
+    let version = randr::query_version(connection, 1, 5).ok()?.reply().ok()?;
+    if version.major_version < 1 || (version.major_version == 1 && version.minor_version < 5) {
+        return None;
+    }
+    let reply = randr::get_monitors(connection, root, true)
+        .ok()?
+        .reply()
+        .ok()?;
+    let monitors: Vec<ScreenInfo> = reply
+        .monitors
+        .iter()
+        .filter(|monitor| monitor.width > 0 && monitor.height > 0)
+        .map(|monitor| ScreenInfo {
+            // The atom name is stable across reordering and hotplug, unlike a
+            // list index, so `switch_screen` cannot silently retarget.
+            id: monitor.name,
+            node_id: 0,
+            x: i32::from(monitor.x),
+            y: i32::from(monitor.y),
+            width: u32::from(monitor.width),
+            height: u32::from(monitor.height),
+            primary: monitor.primary,
+        })
+        .collect();
+    (!monitors.is_empty()).then_some(monitors)
 }
 
 /// Force the monitor out of power saving and nudge the desktop with a
@@ -56,68 +296,222 @@ pub(crate) fn wake_display_blocking(_display: Option<&str>) -> Result<(), String
     Ok(())
 }
 
+/// Clamp a normalized coordinate into a screen-local pixel index.
+#[cfg(feature = "desktop")]
+pub(crate) fn normalized_to_pixel(value: f64, size: u32) -> f64 {
+    value.clamp(0.0, 1.0) * f64::from(size.saturating_sub(1))
+}
+
+/// Whether the desktop is locked. Unknown state counts as unlocked so a host
+/// without logind still serves input; `UU_LOCK_FAIL_CLOSED=1` flips that.
+#[cfg(feature = "desktop")]
+pub(crate) fn lock_active(locked: &watch::Receiver<Option<bool>>) -> bool {
+    match *locked.borrow() {
+        Some(locked) => locked,
+        None => std::env::var("UU_LOCK_FAIL_CLOSED").ok().as_deref() == Some("1"),
+    }
+}
+
 #[cfg(all(test, feature = "desktop"))]
 mod tests {
     use super::*;
-    use x11rb::protocol::dpms::{self, DPMSMode};
+    use crate::desktop::CapturedFrame;
+    use std::process::{Child, Command};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
 
-    struct Child(std::process::Child);
+    #[test]
+    fn normalized_coordinates_stay_inside_the_screen() {
+        assert_eq!(normalized_to_pixel(-1.0, 100), 0.0);
+        assert_eq!(normalized_to_pixel(0.0, 100), 0.0);
+        assert_eq!(normalized_to_pixel(1.0, 100), 99.0);
+        assert_eq!(normalized_to_pixel(2.0, 100), 99.0);
+        assert_eq!(normalized_to_pixel(0.5, 1), 0.0);
+    }
 
-    impl Drop for Child {
+    #[tokio::test]
+    async fn window_and_virtual_sources_are_rejected_without_touching_x11() {
+        for source in [SourceKind::Window, SourceKind::Virtual] {
+            let result = start_at(
+                None,
+                DesktopOptions {
+                    source,
+                    ..DesktopOptions::default()
+                },
+            )
+            .await;
+            let Err(error) = result else {
+                panic!("{source:?} source must be rejected by the X11 backend");
+            };
+            assert!(error.contains("whole monitor"), "{error}");
+            assert!(error.contains("portal"), "{error}");
+        }
+    }
+
+    struct Xvfb(Child);
+
+    impl Drop for Xvfb {
         fn drop(&mut self) {
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
     }
 
-    #[test]
-    #[ignore = "requires Xvfb with the DPMS and XTEST extensions"]
-    fn dpms_wake_turns_the_monitor_on() {
-        let display = format!(":{}", 90 + (std::process::id() % 1000));
-        let child = std::process::Command::new("Xvfb")
-            .args([
-                &display,
-                "-screen",
-                "0",
-                "640x480x24",
-                "+extension",
-                "DPMS",
-                "+extension",
-                "XTEST",
-                "-nolisten",
-                "tcp",
-            ])
+    static NEXT_DISPLAY: AtomicU32 = AtomicU32::new(0);
+
+    /// Start Xvfb on a display number unique to this test binary.
+    fn start_xvfb(width: u32, height: u32) -> (Xvfb, String) {
+        let display = format!(
+            ":{}",
+            90 + (std::process::id() % 500) + NEXT_DISPLAY.fetch_add(1, Ordering::Relaxed) * 2
+        );
+        let geometry = format!("{width}x{height}x24");
+        let child = Command::new("Xvfb")
+            .args([&display, "-screen", "0", &geometry, "-nolisten", "tcp"])
+            .args(["+extension", "RANDR", "+extension", "DAMAGE"])
+            .args(["+extension", "MIT-SHM", "+extension", "XFIXES"])
+            .args(["+extension", "XTEST"])
             .spawn()
             .expect("Xvfb");
-        let _child = Child(child);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let (connection, _screen) = loop {
+        let server = Xvfb(child);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
             match x11rb::connect(Some(&display)) {
-                Ok(connected) => break connected,
-                Err(_) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                Ok(_) => return (server, display),
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(100));
                 }
                 Err(error) => panic!("Xvfb did not start: {error}"),
             }
-        };
-        let dpms_available = match dpms::force_level(&connection, DPMSMode::OFF) {
-            Ok(cookie) => match cookie.check() {
-                Ok(()) => true,
-                Err(x11rb::errors::ReplyError::ConnectionError(
-                    x11rb::errors::ConnectionError::UnsupportedExtension,
-                )) => false,
-                Err(error) => panic!("DPMS force failed: {error}"),
-            },
-            Err(x11rb::errors::ConnectionError::UnsupportedExtension) => false,
-            Err(error) => panic!("DPMS unavailable: {error}"),
-        };
-        wake_display_blocking(Some(&display)).expect("display wake");
-        if dpms_available {
-            let reply = dpms::info(&connection).unwrap().reply().unwrap();
-            assert_eq!(reply.power_level, DPMSMode::ON);
-        } else {
-            // Xvfb builds without DPMS still exercise the XTest path.
-            eprintln!("Xvfb has no DPMS extension; verified the XTest wake path only");
         }
+    }
+
+    fn poll_until<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> T {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(value) = check() {
+                return value;
+            }
+            assert!(Instant::now() < deadline, "condition timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_frame(session: &DesktopSession, timeout: Duration) -> CapturedFrame {
+        poll_until(timeout, || session.latest_frame())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Xvfb with RANDR, DAMAGE, MIT-SHM, XFIXES and XTEST"]
+    async fn xvfb_capture_redraw_pointer_and_keyboard() {
+        use x11rb::connection::Connection;
+        use x11rb::protocol::xproto;
+        use x11rb::protocol::xproto::ConnectionExt as _;
+
+        let (_server, display) = start_xvfb(320, 240);
+        // The harness must exercise the real backend, not the fallbacks.
+        {
+            use x11rb::connection::RequestConnection as _;
+            let (probe, _screen) = x11rb::connect(Some(&display)).unwrap();
+            for extension in ["DAMAGE", "MIT-SHM", "XFIXES", "XTEST", "RANDR"] {
+                assert!(
+                    probe.extension_information(extension).unwrap().is_some(),
+                    "Xvfb is missing {extension}"
+                );
+            }
+        }
+        // Inject an unlocked state: a locked host session (or a fail-closed
+        // env) must not pause the capture this test exercises.
+        let (_locked_tx, locked) = watch::channel(Some(false));
+        let session = start_at_with(Some(&display), DesktopOptions::default(), locked)
+            .await
+            .expect("X11 capture");
+        assert_eq!(
+            session
+                .screens()
+                .first()
+                .map(|screen| (screen.width, screen.height)),
+            Some((320, 240))
+        );
+
+        let first = wait_frame(&session, Duration::from_secs(5));
+        assert_eq!((first.width, first.height), (320, 240));
+        assert_eq!(first.data.len(), 320 * 240 * 4);
+
+        // Drawing into the root must reach the capture through XDamage.
+        let (connection, screen_num) = x11rb::connect(Some(&display)).unwrap();
+        let root = connection.setup().roots[screen_num].root;
+        let white = connection.setup().roots[screen_num].white_pixel;
+        let gc = connection.generate_id().unwrap();
+        connection
+            .create_gc(gc, root, &xproto::CreateGCAux::new().foreground(white))
+            .unwrap();
+        connection
+            .poly_fill_rectangle(
+                root,
+                gc,
+                &[xproto::Rectangle {
+                    x: 0,
+                    y: 0,
+                    width: 320,
+                    height: 240,
+                }],
+            )
+            .unwrap();
+        connection.flush().unwrap();
+        let changed = poll_until(Duration::from_secs(5), || {
+            session
+                .latest_frame()
+                .filter(|frame| frame.data.as_slice() != first.data.as_slice())
+        });
+        assert!(changed
+            .data
+            .chunks_exact(4)
+            .all(|pixel| pixel[0] > 200 && pixel[1] > 200 && pixel[2] > 200));
+
+        // Absolute pointer input lands on the monitor.
+        session.input().pointer_absolute(0.5, 0.5);
+        poll_until(Duration::from_secs(5), || {
+            let reply = xproto::query_pointer(&connection, root)
+                .ok()?
+                .reply()
+                .ok()?;
+            (reply.root_x == 160 && reply.root_y == 120).then_some(())
+        });
+
+        // A key press and release click through XTest and the keymap.
+        let before = xproto::query_keymap(&connection)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .keys;
+        session.input().key(65, true);
+        poll_until(Duration::from_secs(5), || {
+            let keys = xproto::query_keymap(&connection)
+                .unwrap()
+                .reply()
+                .unwrap()
+                .keys;
+            (keys != before).then_some(())
+        });
+        session.input().key(65, false);
+        poll_until(Duration::from_secs(5), || {
+            let keys = xproto::query_keymap(&connection)
+                .unwrap()
+                .reply()
+                .unwrap()
+                .keys;
+            (keys == before).then_some(())
+        });
+
+        // The XFixes thread publishes the current shape.
+        let mut cursor = session.cursor();
+        poll_until(Duration::from_secs(5), || {
+            cursor.borrow_and_update().clone()
+        });
+
+        // DPMS force-on plus the zero-motion XTest event must both resolve.
+        wake_display_blocking(Some(&display)).expect("X11 display wake");
+        session.stop();
     }
 }

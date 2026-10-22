@@ -225,6 +225,8 @@ pub async fn start(options: DesktopOptions) -> Result<DesktopSession, String> {
     let input_target = first.active_target();
     let (frames_tx, frames_rx) = watch::channel(None);
     let (generation_tx, _) = watch::channel(0u64);
+    // Wayland has no global cursor observation; the client draws its own.
+    let (_cursor_tx, cursor_rx) = watch::channel(None);
     let state = Arc::new(DesktopState::new(
         screens,
         active,
@@ -259,6 +261,7 @@ pub async fn start(options: DesktopOptions) -> Result<DesktopSession, String> {
         backend: Backend::Wayland,
         state,
         frames: frames_rx,
+        cursor: cursor_rx,
         input,
         stop,
         task,
@@ -685,7 +688,7 @@ fn smooth_scroll(value: i32) -> f64 {
 
 /// Windows virtual-key to XKB keysym. The portal backend translates keysyms
 /// against the active keyboard layout; unknown layout-specific keys are ignored.
-fn windows_vk_to_keysym(vk: i32) -> Option<u32> {
+pub(crate) fn windows_vk_to_keysym(vk: i32) -> Option<u32> {
     Some(match vk {
         0x30..=0x39 => vk as u32,
         0x41..=0x5a => (vk + 0x20) as u32,
