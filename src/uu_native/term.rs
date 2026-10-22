@@ -3,12 +3,15 @@
 //! Layout: `"TERM"`, version 1, type, two flag bytes, session u32 LE,
 //! payload length u32 LE, payload. Control payloads are JSON.
 
+use crate::terminal::session::SessionEvent;
 use crate::terminal::session::SessionManager;
-use crate::terminal::session::{OpenRequest, SessionList};
+use crate::terminal::session::{OpenRequest, SessionList, OUTPUT_CHUNK};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 pub const OPEN: u8 = 1;
@@ -143,24 +146,93 @@ fn reply(code: i64, message: &str) -> Vec<u8> {
 
 /// One official-client terminal session. Output is mirrored to the peer that
 /// currently owns the BINARY channel; sessions outlive a peer connection.
+///
+/// A viewer is identified by a token so a stale attachment can never steal or
+/// release output that belongs to a newer attach on the same session.
 pub struct HostTerminal {
     manager: SessionManager,
     peer: mpsc::UnboundedSender<Vec<u8>>,
-    attached: std::sync::Mutex<HashSet<u16>>,
-    closed: std::sync::atomic::AtomicBool,
-    unlocked: std::sync::atomic::AtomicBool,
+    attached: Mutex<HashMap<u16, u64>>,
+    next_token: AtomicU64,
+    /// Bounded queue of this peer's terminal events. A viewer that cannot keep
+    /// up is detached by the session instead of stalling the PTY.
+    output: mpsc::Sender<SessionEvent>,
+    events: Mutex<Option<mpsc::Receiver<SessionEvent>>>,
+    closed: AtomicBool,
+    unlocked: AtomicBool,
 }
 
 impl HostTerminal {
     pub fn new(manager: SessionManager, peer: mpsc::UnboundedSender<Vec<u8>>) -> Arc<Self> {
         let unlocked = !manager.has_password();
+        let (output, events) = mpsc::channel(256);
         Arc::new(Self {
             manager,
             peer,
-            attached: std::sync::Mutex::new(HashSet::new()),
-            closed: std::sync::atomic::AtomicBool::new(false),
-            unlocked: std::sync::atomic::AtomicBool::new(unlocked),
+            attached: Mutex::new(HashMap::new()),
+            next_token: AtomicU64::new(1),
+            output,
+            events: Mutex::new(Some(events)),
+            closed: AtomicBool::new(false),
+            unlocked: AtomicBool::new(unlocked),
         })
+    }
+
+    fn next_token(&self) -> u64 {
+        loop {
+            let token = self.next_token.fetch_add(1, Ordering::Relaxed);
+            if token != 0 {
+                return token;
+            }
+        }
+    }
+
+    fn owns(&self, session_id: u16, token: u64) -> bool {
+        self.attached
+            .lock()
+            .map(|attached| attached.get(&session_id) == Some(&token))
+            .unwrap_or(false)
+    }
+
+    /// Release only this peer's attachment. The session keeps recording output
+    /// for the next viewer.
+    fn detach(&self, session_id: u16) {
+        let token = self
+            .attached
+            .lock()
+            .ok()
+            .and_then(|mut attached| attached.remove(&session_id));
+        if let Some(token) = token {
+            self.manager.detach(session_id, token);
+        }
+    }
+
+    fn detach_all(&self) {
+        let sessions: Vec<u16> = self
+            .attached
+            .lock()
+            .map(|attached| attached.keys().copied().collect())
+            .unwrap_or_default();
+        for session_id in sessions {
+            self.detach(session_id);
+        }
+    }
+
+    fn attach(self: &Arc<Self>, session_id: u16) -> crate::error::Result<u64> {
+        let token = self.next_token();
+        // Claim the session before attach queues the replay, so the event loop
+        // never mistakes a stale event for the new viewer's output.
+        self.attached
+            .lock()
+            .map_err(|_| crate::error::Error::Session("terminal state poisoned".to_owned()))?
+            .insert(session_id, token);
+        if let Err(error) = self.manager.attach(session_id, token, self.output.clone()) {
+            if let Ok(mut attached) = self.attached.lock() {
+                attached.remove(&session_id);
+            }
+            return Err(error);
+        }
+        Ok(token)
     }
 
     pub fn handle(self: &Arc<Self>, data: &[u8]) {
@@ -222,10 +294,15 @@ impl HostTerminal {
                             cols,
                             rows
                         );
-                        self.attached.lock().unwrap().insert(response.session_id);
                         let payload =
                             serde_json::to_vec(&response).unwrap_or_else(|_| reply(0, "ok"));
+                        // The response is queued before attach, so the replay
+                        // (queued by attach) can never precede it.
                         self.send(OPEN_RESP, id, &payload);
+                        if let Err(error) = self.attach(response.session_id) {
+                            tracing::warn!("UU terminal attach failed: {error}");
+                            self.send(ERROR, id, &reply(1, &error.to_string()));
+                        }
                     }
                     Err(error) => {
                         tracing::warn!("UU terminal open failed: {error}");
@@ -269,7 +346,7 @@ impl HostTerminal {
             }
             CLOSE => {
                 if let Ok(id) = u16::try_from(session) {
-                    self.attached.lock().unwrap().remove(&id);
+                    self.detach(id);
                     // A closed terminal hangs the shell up, like closing an
                     // SSH session; the session stays listable until it exits.
                     if let Err(error) = self.manager.close(id) {
@@ -279,7 +356,7 @@ impl HostTerminal {
             }
             DETACH => {
                 if let Ok(id) = u16::try_from(session) {
-                    self.attached.lock().unwrap().remove(&id);
+                    self.detach(id);
                 }
             }
             KILL_REQ => {
@@ -306,7 +383,7 @@ impl HostTerminal {
                             Ok(()) => tracing::info!("UU terminal session {id} killed"),
                             Err(error) => tracing::warn!("UU terminal kill failed: {error}"),
                         }
-                        self.attached.lock().unwrap().remove(&id);
+                        self.detach(id);
                         let payload = match result {
                             Ok(()) => reply(0, "ok"),
                             Err(error) => reply(1, &error.to_string()),
@@ -355,40 +432,63 @@ impl HostTerminal {
         }
     }
 
-    pub fn event_loop(
-        self: Arc<Self>,
-        mut events: tokio::sync::broadcast::Receiver<crate::terminal::session::SessionEvent>,
-    ) {
+    pub fn event_loop(self: &Arc<Self>) {
+        let Some(mut events) = self.events.lock().ok().and_then(|mut slot| slot.take()) else {
+            return;
+        };
+        let terminal = self.clone();
         tokio::spawn(async move {
             loop {
                 let event = tokio::select! {
                     event = events.recv() => event,
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-                        if self.closed.load(std::sync::atomic::Ordering::Acquire) { break; }
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        if terminal.closed.load(Ordering::Acquire) {
+                            break;
+                        }
                         continue;
                     }
                 };
+                let Some(event) = event else {
+                    break;
+                };
                 match event {
-                    Ok(crate::terminal::session::SessionEvent::Output { session_id, data }) => {
-                        if !self.attached.lock().unwrap().contains(&session_id) {
+                    SessionEvent::Attach {
+                        session_id,
+                        token,
+                        snapshot,
+                    } => {
+                        if !terminal.owns(session_id, token) {
                             continue;
                         }
-                        for chunk in data.chunks(16 * 1024) {
-                            self.send(STDOUT, u32::from(session_id), chunk);
+                        for chunk in snapshot.chunks(OUTPUT_CHUNK) {
+                            terminal.send(STDOUT, u32::from(session_id), chunk);
                         }
                     }
-                    Ok(crate::terminal::session::SessionEvent::Exited {
+                    SessionEvent::Output {
                         session_id,
-                        exit_code,
-                    }) => {
-                        if self.attached.lock().unwrap().contains(&session_id) {
-                            let payload = json!({"exit_code": exit_code}).to_string();
-                            self.send(EXIT, u32::from(session_id), payload.as_bytes());
+                        token,
+                        data,
+                    } => {
+                        if !terminal.owns(session_id, token) {
+                            continue;
+                        }
+                        for chunk in data.chunks(OUTPUT_CHUNK) {
+                            terminal.send(STDOUT, u32::from(session_id), chunk);
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        break;
+                    SessionEvent::Exited {
+                        session_id,
+                        token,
+                        exit_code,
+                    } => {
+                        if !terminal.owns(session_id, token) {
+                            continue;
+                        }
+                        if let Ok(mut attached) = terminal.attached.lock() {
+                            attached.remove(&session_id);
+                        }
+                        let payload = json!({"exit_code": exit_code}).to_string();
+                        terminal.send(EXIT, u32::from(session_id), payload.as_bytes());
                     }
                 }
             }
@@ -396,8 +496,8 @@ impl HostTerminal {
     }
 
     pub fn close(&self) {
-        self.closed
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.detach_all();
+        self.closed.store(true, Ordering::Release);
     }
 
     fn send(&self, kind: u8, session: u32, payload: &[u8]) {
@@ -540,11 +640,9 @@ mod host_shell_tests {
         while std::time::Instant::now() < deadline {
             if let Ok(event) = events.try_recv() {
                 match event {
-                    crate::terminal::session::SessionEvent::Output { session_id, data }
-                        if session_id == response.session_id =>
-                    {
-                        output.extend(data)
-                    }
+                    crate::terminal::session::SessionEvent::Output {
+                        session_id, data, ..
+                    } if session_id == response.session_id => output.extend(data),
                     crate::terminal::session::SessionEvent::Exited { .. } => {
                         break;
                     }
@@ -555,6 +653,132 @@ mod host_shell_tests {
             }
         }
         assert!(String::from_utf8_lossy(&output).contains("DIRECT_OK"));
+    }
+}
+
+#[cfg(test)]
+mod reattach_tests {
+    use super::*;
+
+    fn occurrences(haystack: &[u8], needle: &str) -> usize {
+        String::from_utf8_lossy(haystack).matches(needle).count()
+    }
+
+    async fn stdout_until(
+        rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+        marker: &str,
+        timeout: Duration,
+    ) -> Vec<u8> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut output = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return output;
+            }
+            let Ok(Some(data)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                return output;
+            };
+            if let Some(frame) = decode(&data) {
+                if frame.kind == STDOUT {
+                    output.extend(frame.payload);
+                    if String::from_utf8_lossy(&output).contains(marker) {
+                        return output;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The official client's `/bin/bash` placeholder is replaced with the
+    /// account shell. Tests need a known shell, so pass an absolute path that
+    /// is not one of the placeholder spellings.
+    fn absolute_bash() -> String {
+        let mut placeholders = Vec::new();
+        if let Some(path) = std::env::var_os("PATH") {
+            for directory in std::env::split_paths(&path) {
+                let candidate = directory.join("bash");
+                if !candidate.is_file() {
+                    continue;
+                }
+                let candidate = candidate.to_string_lossy().into_owned();
+                if !is_client_default_shell(&candidate) {
+                    return candidate;
+                }
+                placeholders.push(candidate);
+            }
+        }
+        placeholders
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "/bin/sh".to_owned())
+    }
+
+    #[tokio::test]
+    async fn reopening_replays_output_exactly_once() {
+        let manager = SessionManager::new(None);
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let terminal = HostTerminal::new(manager.clone(), tx);
+        terminal.event_loop();
+        let payload = format!(r#"{{"cols":80,"rows":24,"shell":"{}"}}"#, absolute_bash());
+        terminal.handle(&encode(OPEN, 0, payload.as_bytes()));
+        let open = decode(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(open.kind, OPEN_RESP);
+        assert_eq!(json(&open.payload)["code"], 0);
+        let id = open.session;
+
+        // A just-spawned login shell can miss input written before it reads.
+        let mut ready = false;
+        let mut probed = Vec::new();
+        for _ in 0..100 {
+            terminal.handle(&encode(STDIN, id, b"printf 'READY_%s\\n' MARK\r\n"));
+            let probe = stdout_until(&mut rx, "READY_MARK", Duration::from_millis(200)).await;
+            if String::from_utf8_lossy(&probe).contains("READY_MARK") {
+                ready = true;
+                break;
+            }
+            if probe.len() > 200 {
+                probed = probe;
+            }
+        }
+        assert!(
+            ready,
+            "the shell never executed a probe: {:?}",
+            String::from_utf8_lossy(&probed)
+        );
+
+        terminal.handle(&encode(STDIN, id, b"printf 'FIRST_%s\\n' MARK\r\n"));
+        let first = stdout_until(&mut rx, "FIRST_MARK", Duration::from_secs(5)).await;
+        assert!(
+            String::from_utf8_lossy(&first).contains("FIRST_MARK"),
+            "no first mark in {:?}",
+            String::from_utf8_lossy(&first)
+        );
+
+        terminal.handle(&encode(DETACH, id, b""));
+        terminal.handle(&encode(STDIN, id, b"printf 'SECOND_%s\\n' MARK\r\n"));
+        let mut leaked = Vec::new();
+        while let Ok(Some(data)) = tokio::time::timeout(Duration::from_millis(400), rx.recv()).await
+        {
+            if let Some(frame) = decode(&data) {
+                if frame.kind == STDOUT {
+                    leaked.extend(frame.payload);
+                }
+            }
+        }
+        assert!(
+            !String::from_utf8_lossy(&leaked).contains("SECOND_MARK"),
+            "a detached viewer received output"
+        );
+
+        terminal.handle(&encode(OPEN, id, br#"{"cols":80,"rows":24}"#));
+        let reopened = decode(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(reopened.kind, OPEN_RESP);
+        let replay = stdout_until(&mut rx, "SECOND_MARK", Duration::from_secs(5)).await;
+        assert_eq!(occurrences(&replay, "FIRST_MARK"), 1);
+        assert_eq!(occurrences(&replay, "SECOND_MARK"), 1);
+        terminal.handle(&encode(KILL_REQ, id, b""));
+        terminal.close();
     }
 }
 

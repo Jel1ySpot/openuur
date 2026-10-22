@@ -2,13 +2,14 @@ use crate::error::{Error, Result};
 use crate::util::now_ms;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenRequest {
@@ -68,21 +69,78 @@ pub struct SessionList {
 
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
-    Output { session_id: u16, data: Vec<u8> },
-    Exited { session_id: u16, exit_code: i32 },
+    Output {
+        session_id: u16,
+        token: u64,
+        data: Vec<u8>,
+    },
+    /// Emitted while the sink lock is held, so the replayed snapshot is queued
+    /// ahead of any subsequent live output for the same token.
+    Attach {
+        session_id: u16,
+        token: u64,
+        snapshot: Vec<u8>,
+    },
+    Exited {
+        session_id: u16,
+        token: u64,
+        exit_code: i32,
+    },
+}
+
+/// Bounded per-session output history replayed on reattach.
+const SCROLLBACK_LIMIT: usize = 256 * 1024;
+/// Replay and live output are chunked well below the SCTP message limit.
+pub const OUTPUT_CHUNK: usize = 16 * 1024;
+
+struct Scrollback {
+    data: VecDeque<u8>,
+}
+
+impl Scrollback {
+    fn new() -> Self {
+        Self {
+            data: VecDeque::new(),
+        }
+    }
+
+    fn record(&mut self, bytes: &[u8]) {
+        self.data.extend(bytes.iter().copied());
+        let excess = self.data.len().saturating_sub(SCROLLBACK_LIMIT);
+        for _ in 0..excess {
+            self.data.pop_front();
+        }
+    }
+
+    fn snapshot(&self) -> Vec<u8> {
+        self.data.iter().copied().collect()
+    }
+}
+
+struct Sink {
+    tx: mpsc::Sender<SessionEvent>,
+    token: u64,
 }
 
 struct InnerSession {
-    info: SessionInfo,
+    info: Mutex<SessionInfo>,
     writer: Mutex<Box<dyn Write + Send>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     last_active: Arc<Mutex<Instant>>,
+    /// Current viewer. Output ordering is guaranteed by holding this lock
+    /// while appending history and sending to the sink.
+    sink: Mutex<Option<Sink>>,
+    scrollback: Mutex<Scrollback>,
+    reader_done: AtomicBool,
 }
 
 impl InnerSession {
     fn info(&self) -> SessionInfo {
-        let mut info = self.info.clone();
+        let mut info = match self.info.lock() {
+            Ok(info) => info.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
         info.last_active_ms = self
             .last_active
             .lock()
@@ -114,7 +172,7 @@ impl InnerSession {
 }
 
 struct Inner {
-    sessions: BTreeMap<u16, InnerSession>,
+    sessions: BTreeMap<u16, Arc<InnerSession>>,
     next_id: u16,
 }
 
@@ -186,7 +244,7 @@ impl SessionManager {
         inner
             .sessions
             .values()
-            .find(|s| s.info.session_name == name)
+            .find(|s| s.info().session_name == name)
             .map(|s| s.info())
     }
 
@@ -242,7 +300,11 @@ impl SessionManager {
 
         let mut inner = self.inner.lock().expect("session manager poisoned");
         if let Some(name) = request.name.as_deref().filter(|s| !s.trim().is_empty()) {
-            if inner.sessions.values().any(|s| s.info.session_name == name) {
+            if inner
+                .sessions
+                .values()
+                .any(|s| s.info().session_name == name)
+            {
                 return Err(Error::Session(format!(
                     "terminal session name already exists: {name}"
                 )));
@@ -304,8 +366,8 @@ impl SessionManager {
         let last_active = Arc::new(Mutex::new(Instant::now()));
         let created_at_ms = now_ms();
 
-        let session = InnerSession {
-            info: SessionInfo {
+        let session = Arc::new(InnerSession {
+            info: Mutex::new(SessionInfo {
                 session_id,
                 session_name: name.clone(),
                 shell: shell.clone(),
@@ -314,22 +376,25 @@ impl SessionManager {
                 last_active_ms: 0,
                 attachable: true,
                 exit_code: None,
-            },
+            }),
             writer: Mutex::new(writer),
             master: Mutex::new(master),
             child: child.clone(),
             last_active: last_active.clone(),
-        };
-        inner.sessions.insert(session_id, session);
+            sink: Mutex::new(None),
+            scrollback: Mutex::new(Scrollback::new()),
+            reader_done: AtomicBool::new(false),
+        });
+        inner.sessions.insert(session_id, session.clone());
 
-        spawn_reader(
+        spawn_reader(session_id, reader, session.clone(), self.events.clone());
+        spawn_waiter(
             session_id,
-            reader,
+            child,
+            session,
             self.events.clone(),
             self.inner.clone(),
-            last_active,
         );
-        spawn_waiter(session_id, child, self.events.clone(), self.inner.clone());
 
         Ok(OpenResponse {
             session_id,
@@ -439,6 +504,9 @@ impl SessionManager {
             .sessions
             .remove(&session_id)
             .ok_or_else(|| Error::Session(format!("terminal session {session_id} not found")))?;
+        if let Ok(mut sink) = session.sink.lock() {
+            *sink = None;
+        }
         #[cfg(unix)]
         {
             session.signal(libc::SIGHUP);
@@ -460,7 +528,7 @@ impl SessionManager {
         if inner
             .sessions
             .values()
-            .any(|s| s.info.session_name == new_name)
+            .any(|s| s.info().session_name == new_name)
         {
             return Err(Error::Session(format!(
                 "terminal session name already exists: {new_name}"
@@ -470,8 +538,75 @@ impl SessionManager {
             .sessions
             .get_mut(&session_id)
             .ok_or_else(|| Error::Session(format!("terminal session {session_id} not found")))?;
-        session.info.session_name = new_name.to_owned();
+        session
+            .info
+            .lock()
+            .map_err(|_| Error::Session("terminal info poisoned".to_owned()))?
+            .session_name = new_name.to_owned();
         Ok(())
+    }
+
+    /// Attach a viewer and queue the buffered history behind the same lock that
+    /// live output uses, so every byte is delivered exactly once and in order.
+    pub fn attach(
+        &self,
+        session_id: u16,
+        token: u64,
+        tx: mpsc::Sender<SessionEvent>,
+    ) -> Result<()> {
+        let session = {
+            let inner = self.inner.lock().expect("session manager poisoned");
+            inner.sessions.get(&session_id).cloned()
+        }
+        .ok_or_else(|| Error::Session(format!("terminal session {session_id} not found")))?;
+        let mut sink = session
+            .sink
+            .lock()
+            .map_err(|_| Error::Session("terminal sink poisoned".to_owned()))?;
+        let snapshot = session
+            .scrollback
+            .lock()
+            .map_err(|_| Error::Session("terminal scrollback poisoned".to_owned()))?
+            .snapshot();
+        let permit = tx
+            .try_reserve()
+            .map_err(|_| Error::Session("terminal viewer is not keeping up".to_owned()))?;
+        permit.send(SessionEvent::Attach {
+            session_id,
+            token,
+            snapshot,
+        });
+        *sink = Some(Sink { tx, token });
+        drop(sink);
+        // Full-screen programs repaint on SIGWINCH, which gives a reattaching
+        // viewer a coherent screen on top of the replayed history.
+        #[cfg(unix)]
+        session.signal(libc::SIGWINCH);
+        Ok(())
+    }
+
+    /// Detach only if this viewer still owns the session, so a stale peer can
+    /// never remove a newer attachment.
+    pub fn detach(&self, session_id: u16, token: u64) {
+        let session = self
+            .inner
+            .lock()
+            .ok()
+            .and_then(|inner| inner.sessions.get(&session_id).cloned());
+        if let Some(session) = session {
+            if let Ok(mut sink) = session.sink.lock() {
+                if sink.as_ref().is_some_and(|sink| sink.token == token) {
+                    *sink = None;
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn viewer(&self, session_id: u16) -> Option<u64> {
+        let session = self.inner.lock().ok()?.sessions.get(&session_id).cloned()?;
+        let token = session.sink.lock().ok()?.as_ref().map(|sink| sink.token);
+        token
     }
 
     pub fn verify_password(&self, password: &str) -> bool {
@@ -489,9 +624,8 @@ impl SessionManager {
 fn spawn_reader(
     session_id: u16,
     mut reader: Box<dyn Read + Send>,
+    session: Arc<InnerSession>,
     events: broadcast::Sender<SessionEvent>,
-    inner: Arc<Mutex<Inner>>,
-    last_active: Arc<Mutex<Instant>>,
 ) {
     thread::spawn(move || {
         let mut buffer = [0u8; 8192];
@@ -499,34 +633,52 @@ fn spawn_reader(
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if let Ok(mut last) = last_active.lock() {
+                    if let Ok(mut last) = session.last_active.lock() {
                         *last = Instant::now();
                     }
-                    let data = buffer[..n].to_vec();
-                    let _ = events.send(SessionEvent::Output { session_id, data });
+                    record_output(&session, session_id, &buffer[..n]);
+                    let _ = events.send(SessionEvent::Output {
+                        session_id,
+                        token: 0,
+                        data: buffer[..n].to_vec(),
+                    });
                 }
                 Err(_) => break,
             }
-            let exited = inner
-                .lock()
-                .ok()
-                .and_then(|inner| {
-                    inner
-                        .sessions
-                        .get(&session_id)
-                        .map(|s| s.info.state == "exited")
-                })
-                .unwrap_or(true);
-            if exited {
-                break;
-            }
         }
+        session.reader_done.store(true, Ordering::Release);
     });
+}
+
+/// Append to history and forward to the current viewer under one lock, so the
+/// replayed snapshot and the live stream can never overlap or leave a gap.
+fn record_output(session: &InnerSession, session_id: u16, data: &[u8]) {
+    let Ok(mut sink) = session.sink.lock() else {
+        return;
+    };
+    if let Ok(mut scrollback) = session.scrollback.lock() {
+        scrollback.record(data);
+    }
+    let Some(active) = sink.as_ref() else {
+        return;
+    };
+    let event = SessionEvent::Output {
+        session_id,
+        token: active.token,
+        data: data.to_vec(),
+    };
+    if active.tx.try_send(event).is_err() {
+        // A viewer that cannot keep up is dropped instead of stalling the PTY.
+        // History keeps recording, so it can reattach and replay later.
+        tracing::warn!("terminal viewer for session {session_id} fell behind; detaching");
+        *sink = None;
+    }
 }
 
 fn spawn_waiter(
     session_id: u16,
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
+    session: Arc<InnerSession>,
     events: broadcast::Sender<SessionEvent>,
     inner: Arc<Mutex<Inner>>,
 ) {
@@ -549,13 +701,28 @@ fn spawn_waiter(
                 Err(_) => break,
             }
         }
+        // Give the reader a moment to drain the pty so EXIT is always the
+        // final frame the viewer sees.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while !session.reader_done.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
         if let Ok(mut inner) = inner.lock() {
             // A finished shell has nothing to reattach to, so drop it from the
             // list the way an SSH session disappears when its shell exits.
             inner.sessions.remove(&session_id);
         }
+        let viewer = session.sink.lock().ok().and_then(|mut sink| sink.take());
+        if let Some(viewer) = viewer {
+            let _ = viewer.tx.try_send(SessionEvent::Exited {
+                session_id,
+                token: viewer.token,
+                exit_code,
+            });
+        }
         let _ = events.send(SessionEvent::Exited {
             session_id,
+            token: 0,
             exit_code,
         });
     });
@@ -795,7 +962,10 @@ mod tests {
         let mut output = Vec::new();
         while Instant::now() < deadline && !String::from_utf8_lossy(&output).contains(&expected) {
             if let Ok(event) = events.try_recv() {
-                if let SessionEvent::Output { session_id, data } = event {
+                if let SessionEvent::Output {
+                    session_id, data, ..
+                } = event
+                {
                     if session_id == response.session_id {
                         output.extend_from_slice(&data);
                     }
@@ -837,7 +1007,10 @@ mod tests {
         let mut output = Vec::new();
         while Instant::now() < deadline && !String::from_utf8_lossy(&output).contains("openuur") {
             if let Ok(event) = rx.try_recv() {
-                if let SessionEvent::Output { session_id, data } = event {
+                if let SessionEvent::Output {
+                    session_id, data, ..
+                } = event
+                {
                     if session_id == response.session_id {
                         output.extend_from_slice(&data);
                     }
@@ -854,5 +1027,204 @@ mod tests {
             "renamed"
         );
         manager.kill(response.session_id).unwrap();
+    }
+
+    #[test]
+    fn scrollback_keeps_the_newest_bytes() {
+        let mut scrollback = Scrollback::new();
+        scrollback.record(&vec![b'a'; SCROLLBACK_LIMIT]);
+        scrollback.record(b"tail");
+        let snapshot = scrollback.snapshot();
+        assert_eq!(snapshot.len(), SCROLLBACK_LIMIT);
+        assert!(snapshot.ends_with(b"tail"));
+        assert!(snapshot.starts_with(b"a"));
+    }
+
+    /// Reads `Output` events until `marker` appears, or the deadline passes.
+    async fn read_until(
+        rx: &mut mpsc::Receiver<SessionEvent>,
+        marker: &str,
+        timeout: Duration,
+    ) -> Vec<u8> {
+        let deadline = Instant::now() + timeout;
+        let mut output = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return output;
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(SessionEvent::Output { data, .. })) => {
+                    output.extend(data);
+                    if String::from_utf8_lossy(&output).contains(marker) {
+                        return output;
+                    }
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) | Err(_) => return output,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reattaching_replays_history_and_respects_ownership() {
+        if cfg!(windows) {
+            return;
+        }
+        let manager = SessionManager::new(None);
+        let mut events = manager.subscribe();
+        let response = manager
+            .open(&OpenRequest {
+                session_id: None,
+                name: None,
+                shell: Some("sh".to_owned()),
+                cols: Some(80),
+                rows: Some(24),
+            })
+            .unwrap();
+        let id = response.session_id;
+        manager.write(id, b"echo HISTORY_MARK\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut seen = Vec::new();
+        while Instant::now() < deadline && !String::from_utf8_lossy(&seen).contains("HISTORY_MARK")
+        {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining, events.recv()).await {
+                Ok(Ok(SessionEvent::Output { data, .. })) => seen.extend(data),
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        assert!(
+            String::from_utf8_lossy(&seen).contains("HISTORY_MARK"),
+            "the session produced no initial output"
+        );
+
+        let (tx, mut rx) = mpsc::channel(16);
+        manager.attach(id, 7, tx).unwrap();
+        let Some(SessionEvent::Attach {
+            token, snapshot, ..
+        }) = rx.recv().await
+        else {
+            panic!("attach queued no replay");
+        };
+        assert_eq!(token, 7);
+        assert!(
+            String::from_utf8_lossy(&snapshot).contains("HISTORY_MARK"),
+            "replay omitted earlier output"
+        );
+
+        // Live output continues to the attached viewer after the replay.
+        manager.write(id, b"echo LIVE_MARK\n").unwrap();
+        let live = read_until(&mut rx, "LIVE_MARK", Duration::from_secs(5)).await;
+        assert!(String::from_utf8_lossy(&live).contains("LIVE_MARK"));
+
+        // A stale token must not release the current viewer.
+        manager.detach(id, 999);
+        manager.write(id, b"echo STILL_ATTACHED\n").unwrap();
+        let still = read_until(&mut rx, "STILL_ATTACHED", Duration::from_secs(5)).await;
+        assert!(String::from_utf8_lossy(&still).contains("STILL_ATTACHED"));
+
+        // The owning token releases the viewer; later output is not delivered.
+        manager.detach(id, 7);
+        manager.write(id, b"echo DETACHED_MARK\n").unwrap();
+        let detached = read_until(&mut rx, "DETACHED_MARK", Duration::from_millis(400)).await;
+        assert!(
+            !String::from_utf8_lossy(&detached).contains("DETACHED_MARK"),
+            "a detached viewer still received output"
+        );
+        manager.kill(id).unwrap();
+    }
+
+    /// Retries a probe until the shell actually executes input; a just-spawned
+    /// login shell can miss bytes written before it starts reading.
+    async fn wait_for_shell(
+        manager: &SessionManager,
+        events: &mut broadcast::Receiver<SessionEvent>,
+        id: u16,
+    ) {
+        for _ in 0..100 {
+            manager.write(id, b"printf 'READY_%s\\n' MARK\n").unwrap();
+            let deadline = Instant::now() + Duration::from_millis(200);
+            let mut seen = Vec::new();
+            while Instant::now() < deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match tokio::time::timeout(remaining, events.recv()).await {
+                    Ok(Ok(SessionEvent::Output { data, .. })) => {
+                        seen.extend(data);
+                        if String::from_utf8_lossy(&seen).contains("READY_MARK") {
+                            return;
+                        }
+                    }
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+        }
+        panic!("the shell never executed a probe");
+    }
+
+    #[tokio::test]
+    async fn a_slow_viewer_is_detached_but_history_keeps_recording() {
+        if cfg!(windows) {
+            return;
+        }
+        let manager = SessionManager::new(None);
+        let mut events = manager.subscribe();
+        let response = manager
+            .open(&OpenRequest {
+                session_id: None,
+                name: None,
+                shell: Some("sh".to_owned()),
+                cols: Some(80),
+                rows: Some(24),
+            })
+            .unwrap();
+        let id = response.session_id;
+        wait_for_shell(&manager, &mut events, id).await;
+        // One queued slot and no consumer: the second output event overflows.
+        let (tx, _rx) = mpsc::channel(1);
+        manager.attach(id, 1, tx).unwrap();
+        assert_eq!(manager.viewer(id), Some(1));
+        manager
+            .write(
+                id,
+                b"head -c 200000 /dev/zero | tr '\\0' a; echo; printf 'SLOW_%s\\n' END\n",
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut seen = Vec::new();
+        while Instant::now() < deadline && !String::from_utf8_lossy(&seen).contains("SLOW_END") {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining, events.recv()).await {
+                Ok(Ok(SessionEvent::Output { data, .. })) => seen.extend(data),
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        assert!(
+            String::from_utf8_lossy(&seen).contains("SLOW_END"),
+            "the flood never finished"
+        );
+        assert_eq!(
+            manager.viewer(id),
+            None,
+            "the session kept a viewer that cannot keep up"
+        );
+
+        // History is independent of the detached viewer, so a new attach
+        // still replays the flood.
+        let (tx, mut rx) = mpsc::channel(4);
+        manager.attach(id, 2, tx).unwrap();
+        let Some(SessionEvent::Attach { snapshot, .. }) = rx.recv().await else {
+            panic!("attach queued no replay");
+        };
+        assert!(
+            snapshot.len() >= 200_000,
+            "history lost output: {} bytes",
+            snapshot.len()
+        );
+        assert!(String::from_utf8_lossy(&snapshot).contains("SLOW_END"));
+        manager.kill(id).unwrap();
     }
 }

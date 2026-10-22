@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::sctp_transport::sctp_transport_capabilities::SCTPTransportCapabilities;
 use webrtc::sctp_transport::sctp_transport_state::RTCSctpTransportState;
@@ -153,18 +153,12 @@ async fn enter_room(config: &Config, runtime: &mut HostRuntime) -> RoomExit {
     };
     runtime.outbox.attach(signal.sender());
     signal.room_info();
-    let events = runtime.manager.subscribe();
-    let exit = room_loop(config, runtime, &mut signal, events).await;
+    let exit = room_loop(config, runtime, &mut signal).await;
     runtime.outbox.detach();
     exit
 }
 
-async fn room_loop(
-    config: &Config,
-    runtime: &mut HostRuntime,
-    signal: &mut Signal,
-    mut events: broadcast::Receiver<crate::terminal::session::SessionEvent>,
-) -> RoomExit {
+async fn room_loop(config: &Config, runtime: &mut HostRuntime, signal: &mut Signal) -> RoomExit {
     let mut tick = tokio::time::interval(Duration::from_secs(2));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut terminate =
@@ -201,7 +195,6 @@ async fn room_loop(
                             &mut runtime.peers,
                             &mut runtime.pending,
                             &data,
-                            events.resubscribe(),
                             config,
                         )
                         .await;
@@ -210,11 +203,6 @@ async fn room_loop(
                         release(&mut runtime.peers, &data).await;
                     }
                     _ => {}
-                }
-            }
-            event = events.recv() => {
-                if matches!(event, Err(broadcast::error::RecvError::Closed)) {
-                    return RoomExit::Shutdown;
                 }
             }
             _ = tick.tick() => maintain(runtime).await,
@@ -335,7 +323,6 @@ async fn create_peer(
     route: Route,
     header: &Value,
     desktop: Option<Arc<DesktopSession>>,
-    events: broadcast::Receiver<crate::terminal::session::SessionEvent>,
     capture_type: u64,
     config: &Config,
 ) -> Result<HostPeer> {
@@ -374,7 +361,7 @@ async fn create_peer(
         }
     });
     let terminal = HostTerminal::new(manager.clone(), term_tx);
-    terminal.clone().event_loop(events);
+    terminal.event_loop();
     install_host_channels(
         &pc,
         manager.clone(),
@@ -1852,7 +1839,6 @@ async fn handle_soac(
     peers: &mut HashMap<String, HostPeer>,
     pending: &mut Vec<Pending>,
     data: &Value,
-    events: broadcast::Receiver<crate::terminal::session::SessionEvent>,
     config: &Config,
 ) {
     let body = data.get("data").unwrap_or(data);
@@ -1948,7 +1934,6 @@ async fn handle_soac(
                 route.clone(),
                 &header,
                 desktop,
-                events,
                 capture_type,
                 config,
             )
@@ -2227,7 +2212,7 @@ mod local_webrtc_tests {
             }
         });
         let terminal = HostTerminal::new(manager.clone(), host_tx);
-        terminal.clone().event_loop(manager.subscribe());
+        terminal.event_loop();
         install_host_channels(
             &host_pc,
             manager,
@@ -2396,10 +2381,9 @@ mod host_terminal_events {
     #[tokio::test]
     async fn async_host_terminal_streams() {
         let manager = SessionManager::new(None);
-        let events = manager.subscribe();
         let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let terminal = HostTerminal::new(manager.clone(), tx);
-        terminal.clone().event_loop(events);
+        terminal.event_loop();
         terminal.handle(&term::encode(
             term::OPEN,
             0,

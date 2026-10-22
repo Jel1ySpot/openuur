@@ -577,12 +577,12 @@ async fn run_local_terminal(config: &Config, args: &TermArgs) -> anyhow::Result<
         tokio::select! {
             event = events.recv() => {
                 match event {
-                    Ok(SessionEvent::Output { session_id: id, data }) if id == session_id => {
+                    Ok(SessionEvent::Output { session_id: id, data, .. }) if id == session_id => {
                         let mut stdout = tokio::io::stdout();
                         stdout.write_all(&data).await?;
                         stdout.flush().await?;
                     }
-                    Ok(SessionEvent::Exited { session_id: id, exit_code: code }) if id == session_id => {
+                    Ok(SessionEvent::Exited { session_id: id, exit_code: code, .. }) if id == session_id => {
                         exit_code = code;
                         break;
                     }
