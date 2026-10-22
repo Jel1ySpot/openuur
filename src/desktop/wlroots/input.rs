@@ -6,6 +6,7 @@
 
 use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::Duration;
@@ -99,7 +100,7 @@ pub(super) fn request_wake(
 impl WlrootsState {
     pub(super) fn drain_commands(&mut self) {
         while let Ok(command) = self.commands.try_recv() {
-            if self.locked && !matches!(command, Command::Wake) {
+            if (self.locked || self.suspended) && !matches!(command, Command::Wake) {
                 continue;
             }
             self.handle_command(command);
@@ -109,11 +110,7 @@ impl WlrootsState {
     fn handle_command(&mut self, command: Command) {
         match command {
             Command::Absolute { x, y } => {
-                let screens = self
-                    .desktop
-                    .as_ref()
-                    .map(|desktop| desktop.screens())
-                    .unwrap_or_default();
+                let screens = self.input_screens();
                 let active = self
                     .desktop
                     .as_ref()
@@ -204,8 +201,19 @@ impl WlrootsState {
 
     fn send_modifiers(&self) {
         if let Some(keyboard) = &self.keyboard {
-            keyboard.modifiers(self.depressed, 0, 0, 0);
+            // Locks are tracked from the keys we inject ourselves; the
+            // virtual keyboard starts with an empty state, so this matches
+            // the compositor's xkb state. Sending zero would clear Caps Lock.
+            let locked =
+                (if self.caps_locked { 2 } else { 0 }) | (if self.num_locked { 16 } else { 0 });
+            keyboard.modifiers(self.depressed, 0, locked, 0);
         }
+    }
+
+    /// True once input must stop: the session locked, the machine is
+    /// suspending, or the backend is shutting down.
+    fn typing_paused(&self) -> bool {
+        self.locked || self.suspended || self.stop.load(Ordering::Acquire)
     }
 
     fn shift_bit(&self) -> u32 {
@@ -220,7 +228,10 @@ impl WlrootsState {
             return false;
         };
         self.set_key(keycode, true);
-        self.depressed |= self.shift_bit();
+        let bit = self.shift_bit();
+        let count = self.modifier_counts.entry(bit).or_insert(0);
+        *count = count.saturating_add(1);
+        self.depressed |= bit;
         self.send_modifiers();
         true
     }
@@ -230,7 +241,16 @@ impl WlrootsState {
             return;
         };
         self.set_key(keycode, false);
-        self.depressed &= !self.shift_bit();
+        let bit = self.shift_bit();
+        let mut cleared = false;
+        if let Some(count) = self.modifier_counts.get_mut(&bit) {
+            *count = count.saturating_sub(1);
+            cleared = *count == 0;
+        }
+        if cleared {
+            self.modifier_counts.remove(&bit);
+            self.depressed &= !bit;
+        }
         self.send_modifiers();
     }
 
@@ -249,7 +269,21 @@ impl WlrootsState {
         let synthetic_shift = shift && modifier.is_none() && self.press_synthetic_shift();
         self.set_key(keycode, true);
         if let Some(bit) = modifier {
-            self.depressed |= bit;
+            // Several VKs map to the same modifier (both Shift keys, both
+            // Control keys), so count holders instead of clearing the bit on
+            // the first release.
+            let count = self.modifier_counts.entry(bit).or_insert(0);
+            *count = count.saturating_add(1);
+            if *count == 1 {
+                self.depressed |= bit;
+            }
+        }
+        match keysym {
+            0xffe5 => self.caps_locked = !self.caps_locked,
+            0xff7f => self.num_locked = !self.num_locked,
+            _ => {}
+        }
+        if modifier.is_some() || matches!(keysym, 0xffe5 | 0xff7f) {
             self.send_modifiers();
         }
         self.held.insert(
@@ -268,7 +302,15 @@ impl WlrootsState {
         };
         self.set_key(held.keycode, false);
         if let Some(bit) = held.modifier {
-            self.depressed &= !bit;
+            let mut cleared = false;
+            if let Some(count) = self.modifier_counts.get_mut(&bit) {
+                *count = count.saturating_sub(1);
+                cleared = *count == 0;
+            }
+            if cleared {
+                self.modifier_counts.remove(&bit);
+                self.depressed &= !bit;
+            }
             self.send_modifiers();
         }
         if held.synthetic_shift {
@@ -288,6 +330,12 @@ impl WlrootsState {
     fn type_text(&mut self, text: &str) {
         let mut extras: Vec<char> = Vec::new();
         for ch in text.chars() {
+            // A paste can be long; stop as soon as the session locks or the
+            // host starts shutting down.
+            if self.typing_paused() {
+                extras.clear();
+                return;
+            }
             let keysym = keysym_for(ch);
             match keysym.and_then(|keysym| self.keymap.lookup(keysym)) {
                 Some((keycode, shift)) => {
@@ -331,6 +379,9 @@ impl WlrootsState {
         self.keymap = temporary;
         self.send_keymap();
         for ch in chars.iter() {
+            if self.typing_paused() {
+                break;
+            }
             if let Some(&(_, keycode)) = assigned.iter().find(|(assigned, _)| assigned == ch) {
                 self.tap(keycode, false);
             }
@@ -365,6 +416,7 @@ impl WlrootsState {
             pointer.frame();
         }
         self.depressed = 0;
+        self.modifier_counts.clear();
         self.send_modifiers();
     }
 }

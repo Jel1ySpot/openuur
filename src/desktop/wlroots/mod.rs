@@ -28,6 +28,9 @@ use wayland_client::protocol::{wl_output, wl_registry, wl_seat, wl_shm};
 use wayland_client::{
     backend::WaylandError, Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
 };
+use wayland_protocols::xdg::xdg_output::zv1::client::{
+    zxdg_output_manager_v1::ZxdgOutputManagerV1, zxdg_output_v1::ZxdgOutputV1,
+};
 use wayland_protocols_wlr::output_power_management::v1::client::zwlr_output_power_manager_v1::ZwlrOutputPowerManagerV1;
 
 use super::encoder::display_fps;
@@ -55,6 +58,14 @@ struct OutputEntry {
     y: i32,
     width: u32,
     height: u32,
+    /// Logical layout position/size from `zxdg_output_v1`. wlroots always
+    /// reports wl_output.geometry as (0,0), so this is the only source of
+    /// real output placement; zeros fall back to the mode size.
+    logical_x: i32,
+    logical_y: i32,
+    logical_width: u32,
+    logical_height: u32,
+    xdg: Option<ZxdgOutputV1>,
 }
 
 /// Data attached to a `wl_output` proxy.
@@ -87,6 +98,7 @@ pub(super) struct WlrootsState {
     #[allow(dead_code)]
     keyboard_manager: Option<ZwpVirtualKeyboardManagerV1>,
     power_manager: Option<ZwlrOutputPowerManagerV1>,
+    xdg_manager: Option<ZxdgOutputManagerV1>,
     outputs: Vec<OutputEntry>,
     output_globals: HashMap<u32, u32>,
     next_output_id: u32,
@@ -103,6 +115,13 @@ pub(super) struct WlrootsState {
     keymap: Keymap,
     base_keymap: Keymap,
     pub(super) depressed: u32,
+    /// How many held virtual keys map to each modifier bit. Several VKs share
+    /// one keysym (both Shift keys, both Control keys), so a plain bitmask
+    /// would clear the modifier when only one of them is released.
+    pub(super) modifier_counts: HashMap<u32, u16>,
+    /// Lock state last applied by our own injected Caps/Num Lock keys.
+    pub(super) caps_locked: bool,
+    pub(super) num_locked: bool,
     pub(super) held: HashMap<i32, HeldKey>,
     pub(super) buttons: std::collections::HashSet<i32>,
     power_objects: HashMap<u32, ZwlrOutputPowerV1>,
@@ -322,6 +341,9 @@ fn open(args: &mut RunArgs) -> Result<(WlrootsState, EventQueue<WlrootsState>), 
         tracing::warn!("compositor has no virtual keyboard; remote keys are unavailable");
     }
     let power_manager: Option<ZwlrOutputPowerManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
+    // Logical output positions; wl_output.geometry is always (0,0) on
+    // wlroots, so this protocol is what makes multi-monitor mapping correct.
+    let xdg_manager: Option<ZxdgOutputManagerV1> = globals.bind(&qh, 1..=3, ()).ok();
     let keymap = Keymap::load()?;
     let pointer = pointer_manager.create_virtual_pointer(Some(&seat), &qh, ());
     let keyboard = keyboard_manager
@@ -337,6 +359,7 @@ fn open(args: &mut RunArgs) -> Result<(WlrootsState, EventQueue<WlrootsState>), 
         screencopy,
         keyboard_manager,
         power_manager,
+        xdg_manager,
         outputs: Vec::new(),
         output_globals: HashMap::new(),
         next_output_id: 0,
@@ -353,6 +376,9 @@ fn open(args: &mut RunArgs) -> Result<(WlrootsState, EventQueue<WlrootsState>), 
         keymap: keymap.clone(),
         base_keymap: keymap,
         depressed: 0,
+        modifier_counts: HashMap::new(),
+        caps_locked: false,
+        num_locked: false,
         held: HashMap::new(),
         buttons: std::collections::HashSet::new(),
         power_objects: HashMap::new(),
@@ -594,6 +620,35 @@ impl WlrootsState {
         screens
     }
 
+    /// Logical output layout used for absolute pointer mapping. Pointer
+    /// coordinates are in compositor logical space, not buffer pixels.
+    pub(super) fn input_screens(&self) -> Vec<ScreenInfo> {
+        self.outputs
+            .iter()
+            .map(|output| {
+                let width = if output.logical_width > 0 {
+                    output.logical_width
+                } else {
+                    output.width
+                };
+                let height = if output.logical_height > 0 {
+                    output.logical_height
+                } else {
+                    output.height
+                };
+                ScreenInfo {
+                    id: output.id,
+                    node_id: 0,
+                    x: output.logical_x,
+                    y: output.logical_y,
+                    width,
+                    height,
+                    primary: false,
+                }
+            })
+            .collect()
+    }
+
     fn publish_screens(&mut self) {
         let Some(desktop) = &self.desktop else {
             return;
@@ -619,6 +674,10 @@ impl WlrootsState {
             return;
         };
         self.next_output_id = self.next_output_id.wrapping_add(1);
+        let xdg = self
+            .xdg_manager
+            .as_ref()
+            .map(|manager| manager.get_xdg_output(&output, &self.qh, OutputData { id }));
         self.outputs.push(OutputEntry {
             id,
             output: output.clone(),
@@ -627,6 +686,11 @@ impl WlrootsState {
             y: 0,
             width: 0,
             height: 0,
+            logical_x: 0,
+            logical_y: 0,
+            logical_width: 0,
+            logical_height: 0,
+            xdg,
         });
         self.output_globals.insert(name, id);
         if let Some(manager) = &self.power_manager {
@@ -642,6 +706,9 @@ impl WlrootsState {
         };
         if let Some(index) = self.outputs.iter().position(|output| output.id == id) {
             let entry = self.outputs.remove(index);
+            if let Some(xdg) = entry.xdg {
+                xdg.destroy();
+            }
             // wl_output.release exists from version 3; older objects can only
             // be dropped (the protocol has no destroy request).
             if entry.version >= 3 {
@@ -718,6 +785,47 @@ impl Dispatch<wl_seat::WlSeat, ()> for WlrootsState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+    }
+}
+
+impl Dispatch<ZxdgOutputManagerV1, ()> for WlrootsState {
+    fn event(
+        _: &mut Self,
+        _: &ZxdgOutputManagerV1,
+        _: <ZxdgOutputManagerV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZxdgOutputV1, OutputData> for WlrootsState {
+    fn event(
+        state: &mut Self,
+        _: &ZxdgOutputV1,
+        event: <ZxdgOutputV1 as Proxy>::Event,
+        data: &OutputData,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use wayland_protocols::xdg::xdg_output::zv1::client::zxdg_output_v1::Event;
+        let Some(output) = state.outputs.iter_mut().find(|output| output.id == data.id) else {
+            return;
+        };
+        match event {
+            Event::LogicalPosition { x, y } => {
+                output.logical_x = x;
+                output.logical_y = y;
+                state.dirty = true;
+            }
+            Event::LogicalSize { width, height } => {
+                output.logical_width = width.max(0) as u32;
+                output.logical_height = height.max(0) as u32;
+                state.dirty = true;
+            }
+            _ => {}
+        }
     }
 }
 
