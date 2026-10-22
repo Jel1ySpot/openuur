@@ -19,6 +19,7 @@ pub mod cursor;
 pub mod desktop_power;
 pub mod encoder;
 pub mod hevc;
+pub mod input_map;
 pub mod portal_permissions;
 pub mod session_env;
 pub mod session_lock;
@@ -253,6 +254,9 @@ pub trait InputSink: Send + Sync {
     /// Windows virtual-key code from the official CONTROL JSON.
     fn key(&self, vk: i32, pressed: bool);
     fn text(&self, text: &str);
+    /// Drop any translated key state after input was paused (lock/suspend).
+    /// Backends that hold no translation state may ignore this.
+    fn reset(&self) {}
 }
 
 /// Shared mutable capture state. The portal supervisor replaces the screen

@@ -21,6 +21,7 @@ use x11rb::protocol::xtest;
 use x11rb::protocol::Event;
 use x11rb::wrapper::ConnectionExt as _;
 
+use super::super::input_map::{keysym_for, windows_vk_to_keysym};
 use super::super::{DesktopState, InputSink};
 
 const INIT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -539,7 +540,7 @@ impl Keyboard {
         pressed: bool,
         held: &mut HashMap<i32, Held>,
     ) -> Result<(), String> {
-        let Some(keysym) = super::super::wayland::windows_vk_to_keysym(vk) else {
+        let Some(keysym) = windows_vk_to_keysym(vk) else {
             return Ok(());
         };
         if pressed {
@@ -721,25 +722,6 @@ fn release_all(
 /// synthesizing Shift would turn KP_7 into KP_Home.
 fn is_keypad(keysym: u32) -> bool {
     (0xff80..=0xffbd).contains(&keysym)
-}
-
-/// Map a character to an X11 keysym. Latin-1 codepoints are their own keysym;
-/// everything above uses the Unicode keysym range.
-fn keysym_for(ch: char) -> Option<u32> {
-    match ch {
-        '\r' | '\n' => Some(0xff0d),
-        '\t' => Some(0xff09),
-        '\u{8}' => Some(0xff08),
-        '\u{1b}' => Some(0xff1b),
-        ch => {
-            let codepoint = ch as u32;
-            match codepoint {
-                0x20..=0x7e | 0xa0..=0xff => Some(codepoint),
-                0x100..=0x10ffff => Some(0x0100_0000 | codepoint),
-                _ => None,
-            }
-        }
-    }
 }
 
 #[cfg(test)]

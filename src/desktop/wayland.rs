@@ -609,7 +609,7 @@ async fn dispatch_input(
                 .await
         }
         InputEvent::Button { button, pressed } => {
-            let Some(button) = wire_button(button) else {
+            let Some(button) = super::input_map::wire_button(button) else {
                 return;
             };
             remote.notify_pointer_button(session, button, pressed).await
@@ -622,11 +622,15 @@ async fn dispatch_input(
                 return;
             }
             remote
-                .notify_pointer_axis(session, smooth_scroll(dx), smooth_scroll(dy))
+                .notify_pointer_axis(
+                    session,
+                    super::input_map::smooth_scroll(dx),
+                    super::input_map::smooth_scroll(dy),
+                )
                 .await
         }
         InputEvent::Key { vk, pressed } => {
-            let Some(keysym) = windows_vk_to_keysym(vk) else {
+            let Some(keysym) = super::input_map::windows_vk_to_keysym(vk) else {
                 return;
             };
             remote
@@ -654,129 +658,9 @@ async fn dispatch_input(
     }
 }
 
-fn wire_button(button: i32) -> Option<i32> {
-    // UU uses 1/2/4 for left/right/middle. The portal RemoteDesktop API
-    // expects Linux evdev button codes (BTN_LEFT/BTN_RIGHT/BTN_MIDDLE),
-    // not X11 or UU button numbers.
-    match button {
-        1 => Some(0x110),
-        2 => Some(0x111),
-        4 => Some(0x112),
-        _ => None,
-    }
-}
-
-/// Normalize UU wheel deltas to portal axis units.
-///
-/// The official client sends smooth pixel deltas (tens per event), so those
-/// pass through unchanged, matching the portal's "same as pointer motion"
-/// contract. Windows wheel deltas (120 per notch) map to one 10-unit axis
-/// step, and notch counts (1..5) map to 10 units each.
-fn smooth_scroll(value: i32) -> f64 {
-    let value = f64::from(value);
-    let magnitude = value.abs();
-    if magnitude == 0.0 {
-        0.0
-    } else if magnitude <= 5.0 {
-        value * 10.0
-    } else if magnitude >= 100.0 {
-        value / 12.0
-    } else {
-        value
-    }
-}
-
-/// Windows virtual-key to XKB keysym. The portal backend translates keysyms
-/// against the active keyboard layout; unknown layout-specific keys are ignored.
-pub(crate) fn windows_vk_to_keysym(vk: i32) -> Option<u32> {
-    Some(match vk {
-        0x30..=0x39 => vk as u32,
-        0x41..=0x5a => (vk + 0x20) as u32,
-        0x60..=0x69 => 0xffb0 + (vk - 0x60) as u32,
-        0x70..=0x87 => 0xffbe + (vk - 0x70) as u32,
-        0x08 => 0xff08,
-        0x09 => 0xff09,
-        0x0c => 0xff0b,
-        0x0d => 0xff0d,
-        0x10 | 0xa0 => 0xffe1,
-        0xa1 => 0xffe2,
-        0x11 | 0xa2 => 0xffe3,
-        0xa3 => 0xffe4,
-        0x12 | 0xa4 => 0xffe9,
-        0xa5 => 0xffea,
-        0x13 => 0xff13,
-        0x14 => 0xffe5,
-        0x1b => 0xff1b,
-        0x20 => 0x0020,
-        0x21 => 0xff55,
-        0x22 => 0xff56,
-        0x23 => 0xff57,
-        0x24 => 0xff50,
-        0x25 => 0xff51,
-        0x26 => 0xff52,
-        0x27 => 0xff53,
-        0x28 => 0xff54,
-        0x2c => 0xff61,
-        0x2d => 0xff63,
-        0x2e => 0xffff,
-        0x5b => 0xffeb,
-        0x5c => 0xffec,
-        0x5d => 0xff67,
-        0x6a => 0xffaa,
-        0x6b => 0xffab,
-        0x6c => 0xffac,
-        0x6d => 0xffad,
-        0x6e => 0xffae,
-        0x6f => 0xffaf,
-        0x90 => 0xff7f,
-        0x91 => 0xff14,
-        0xba => 0x003b,
-        0xbb => 0x003d,
-        0xbc => 0x002c,
-        0xbd => 0x002d,
-        0xbe => 0x002e,
-        0xbf => 0x002f,
-        0xc0 => 0x0060,
-        0xdb => 0x005b,
-        0xdc => 0x005c,
-        0xdd => 0x005d,
-        0xde => 0x0027,
-        _ => return None,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn wire_buttons_follow_uuit_bitmask() {
-        // UU 1/2/4 -> evdev BTN_LEFT/BTN_RIGHT/BTN_MIDDLE.
-        assert_eq!(wire_button(1), Some(0x110));
-        assert_eq!(wire_button(2), Some(0x111));
-        assert_eq!(wire_button(4), Some(0x112));
-        assert_eq!(wire_button(3), None);
-    }
-
-    #[test]
-    fn wheel_deltas_normalize_to_axis_units() {
-        assert_eq!(smooth_scroll(0), 0.0);
-        assert_eq!(smooth_scroll(1), 10.0);
-        assert_eq!(smooth_scroll(-3), -30.0);
-        assert_eq!(smooth_scroll(120), 10.0);
-        assert_eq!(smooth_scroll(-120), -10.0);
-        // Smooth pixel deltas pass through unchanged.
-        assert_eq!(smooth_scroll(15), 15.0);
-        assert_eq!(smooth_scroll(-44), -44.0);
-    }
-
-    #[test]
-    fn keyboard_mapping_uses_unshifted_letters_and_named_keys() {
-        assert_eq!(windows_vk_to_keysym(65), Some(u32::from(b'a')));
-        assert_eq!(windows_vk_to_keysym(160), Some(0xffe1));
-        assert_eq!(windows_vk_to_keysym(37), Some(0xff51));
-        assert_eq!(windows_vk_to_keysym(999), None);
-    }
 
     #[test]
     fn source_kinds_map_to_portal_types() {

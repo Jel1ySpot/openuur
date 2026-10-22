@@ -44,6 +44,7 @@ struct Pending {
     app: String,
     header: Value,
     created_at: std::time::Instant,
+    controller_mac: bool,
     desktop: Option<tokio::sync::oneshot::Receiver<std::result::Result<StartedDesktop, String>>>,
 }
 
@@ -330,6 +331,17 @@ fn remember_connect(
     if !matches!(capture_type, 1 | 2 | 5 | 7 | 8 | 9) {
         return;
     }
+    let platform = attachment
+        .as_deref()
+        .and_then(|bytes| {
+            wire::decode(bytes).or_else(|| {
+                (bytes.first() == Some(&4))
+                    .then(|| wire::decode(&bytes[1..]))
+                    .flatten()
+            })
+        })
+        .and_then(|fields| wire::uint(&fields, 8));
+    let controller_mac = crate::desktop::input_map::controller_is_mac(&header, platform);
     let desktop = if matches!(capture_type, 1 | 2) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let source = if capture_type == 2 {
@@ -384,6 +396,7 @@ fn remember_connect(
         app: find_str(&header, &["app_control_id", "appControlId"]).unwrap_or_default(),
         header,
         created_at: std::time::Instant::now(),
+        controller_mac,
         desktop,
     });
     tracing::info!("native UU capture_type={capture_type} request remembered");
@@ -398,6 +411,7 @@ async fn create_peer(
     desktop: Option<Arc<DesktopSession>>,
     session: Option<SessionIdentity>,
     capture_type: u64,
+    controller_mac: bool,
     config: &Config,
 ) -> Result<HostPeer> {
     let configuration = rtc::ice_config(header).map_err(Error::Protocol)?;
@@ -446,6 +460,7 @@ async fn create_peer(
         video_track.clone(),
         actions.clone(),
         capture_type,
+        controller_mac,
         config.clone(),
     );
     network_diagnostics::start(Arc::downgrade(&pc));
@@ -1024,9 +1039,22 @@ fn install_host_channels(
     video_track: Option<Arc<crate::desktop::video_track::VideoTrack>>,
     actions: Arc<PeerActions>,
     capture_type: u64,
+    controller_mac: bool,
     config: Config,
 ) {
     let sequence = Arc::new(AtomicU64::new(1));
+    // Every desktop peer maps controller shortcuts in front of the backend.
+    let mapped_input: Option<Arc<dyn crate::desktop::InputSink>> =
+        desktop.as_ref().map(|desktop| {
+            Arc::new(
+                crate::desktop::input_map::MappedInput::new(
+                    desktop.input(),
+                    controller_mac,
+                    desktop.backend == crate::desktop::Backend::X11,
+                )
+                .with_lock(crate::desktop::session_lock::watch_locked()),
+            ) as Arc<dyn crate::desktop::InputSink>
+        });
     let clipboard_ready = Arc::new(AtomicBool::new(false));
     let sound = crate::desktop::audio::enabled();
     let save_path = config.file_save_path();
@@ -1159,6 +1187,7 @@ fn install_host_channels(
         let file_channel = file_channel.clone();
         let control_channel = control_channel.clone();
         let text_channel = text_channel.clone();
+        let mapped_input = mapped_input.clone();
         Box::pin(async move {
             tracing::info!("native UU data channel opened: {label}");
 
@@ -1508,6 +1537,7 @@ fn install_host_channels(
                     let sequence = sequence.clone();
                     let save_location = save_location.clone();
                     let video_track = video_track.clone();
+                    let mapped_input = mapped_input.clone();
                     let lock_watch = crate::desktop::session_lock::watch_locked();
                     Box::pin(async move {
                         let data = message.data.to_vec();
@@ -1554,16 +1584,22 @@ fn install_host_channels(
                             }
                         }
 
-                        if let Some(desktop) = &desktop {
+                        if let Some(input) = &mapped_input {
                             if let Ok(value) = serde_json::from_slice::<Value>(&data) {
                                 let locked =
                                     crate::desktop::session_lock::effective_locked(*lock_watch.borrow());
-                                if !locked && handle_desktop_input(desktop.input(), &value) {
+                                if !locked && handle_desktop_input(input.clone(), &value) {
                                     crate::desktop::clipboard::mark_focus();
                                     return;
                                 }
-                                if locked && value.get("action").is_some() {
-                                    return;
+                                if locked {
+                                    // Releases sent while the session was
+                                    // locking never reached the mapping layer;
+                                    // clear translated state before unlock.
+                                    input.reset();
+                                    if value.get("action").is_some() {
+                                        return;
+                                    }
                                 }
                             }
                         }
@@ -2020,6 +2056,10 @@ async fn handle_soac(
                 .map(|item| item.header.clone())
                 .unwrap_or(Value::Null);
             let capture_type = request.as_ref().map(|item| item.capture_type).unwrap_or(0);
+            let controller_mac = request
+                .as_ref()
+                .map(|item| item.controller_mac)
+                .unwrap_or_else(|| crate::desktop::input_map::controller_is_mac(&header, None));
             let desktop = if matches!(capture_type, 1 | 2) {
                 let receiver = request.as_mut().and_then(|item| item.desktop.take());
                 let Some(receiver) = receiver else {
@@ -2068,6 +2108,7 @@ async fn handle_soac(
                 desktop.map(|started| started.desktop),
                 session,
                 capture_type,
+                controller_mac,
                 config,
             )
             .await
@@ -2449,6 +2490,7 @@ mod local_webrtc_tests {
             None,
             Arc::new(PeerActions::default()),
             8,
+            false,
             Config::default(),
         );
 

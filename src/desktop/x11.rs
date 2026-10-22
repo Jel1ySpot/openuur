@@ -316,10 +316,221 @@ pub(crate) fn wake_display_blocking(_display: Option<&str>) -> Result<(), String
     Ok(())
 }
 
+#[cfg(not(feature = "desktop"))]
+#[allow(dead_code)]
+pub(crate) fn active_window_is_terminal() -> Option<bool> {
+    None
+}
+
 /// Clamp a normalized coordinate into a screen-local pixel index.
 #[cfg(feature = "desktop")]
 pub(crate) fn normalized_to_pixel(value: f64, size: u32) -> f64 {
     value.clamp(0.0, 1.0) * f64::from(size.saturating_sub(1))
+}
+
+/// Terminal window classes that expect Ctrl+Shift+V for paste.
+#[cfg(feature = "desktop")]
+const TERMINAL_CLASSES: &[&str] = &[
+    "alacritty",
+    "console",
+    "foot",
+    "footclient",
+    "ghostty",
+    "gnome-terminal",
+    "gnome-terminal-server",
+    "guake",
+    "hyper",
+    "kgx",
+    "kitty",
+    "konsole",
+    "lxterminal",
+    "ptyxis",
+    "qterminal",
+    "rxvt",
+    "sakura",
+    "st",
+    "st-256color",
+    "tabby",
+    "terminator",
+    "terminology",
+    "termite",
+    "tilda",
+    "tilix",
+    "urxvt",
+    "wezterm",
+    "warp",
+    "x-terminal-emulator",
+    "xfce4-terminal",
+    "xterm",
+    "uxterm",
+];
+
+/// Whether the active X11 window is a terminal emulator.
+///
+/// The first call performs a query and seeds a background refresher; every
+/// later call reads the last result without touching the X server. A frozen
+/// display therefore slows focus detection at most once instead of blocking
+/// the input path. `None` means the focus cannot be observed (no X11
+/// display), which callers treat as "not a terminal".
+#[cfg(feature = "desktop")]
+pub(crate) fn active_window_is_terminal() -> Option<bool> {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::Once;
+    use std::time::Duration;
+    use x11rb::connection::Connection as _;
+
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    static STARTED: Once = Once::new();
+
+    STARTED.call_once(|| {
+        if std::env::var_os("DISPLAY").is_none() {
+            return;
+        }
+        if let Some(value) = query_terminal_focus() {
+            STATE.store(if value { 1 } else { 2 }, Ordering::Release);
+        }
+        let _ = std::thread::Builder::new()
+            .name("openuur-focus".into())
+            .spawn(|| {
+                let mut connection = None;
+                loop {
+                    if connection.is_none() {
+                        connection = x11rb::connect(None).ok();
+                    }
+                    let value = connection.as_ref().and_then(|(conn, screen)| {
+                        let root = conn.setup().roots[*screen].root;
+                        terminal_focus_with_connection(conn, root)
+                    });
+                    STATE.store(
+                        match value {
+                            Some(true) => 1,
+                            Some(false) => 2,
+                            None => 0,
+                        },
+                        Ordering::Release,
+                    );
+                    if value.is_none() {
+                        connection = None;
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            });
+    });
+    match STATE.load(Ordering::Acquire) {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "desktop")]
+fn query_terminal_focus() -> Option<bool> {
+    query_terminal_focus_on(None)
+}
+
+/// The display-parameterised form lets tests avoid touching `DISPLAY`.
+#[cfg(feature = "desktop")]
+fn query_terminal_focus_on(display: Option<&str>) -> Option<bool> {
+    use x11rb::connection::Connection as _;
+    if display.is_none() && std::env::var_os("DISPLAY").is_none() {
+        return None;
+    }
+    let (connection, screen_num) = x11rb::connect(display).ok()?;
+    let root = connection.setup().roots[screen_num].root;
+    terminal_focus_with_connection(&connection, root)
+}
+
+#[cfg(feature = "desktop")]
+fn terminal_focus_with_connection(
+    connection: &impl x11rb::connection::Connection,
+    root: u32,
+) -> Option<bool> {
+    use x11rb::protocol::xproto::{self, AtomEnum};
+
+    let active_atom = xproto::intern_atom(connection, false, b"_NET_ACTIVE_WINDOW")
+        .ok()?
+        .reply()
+        .ok()?
+        .atom;
+    let mut window = x11rb::NONE;
+    if active_atom != x11rb::NONE {
+        if let Ok(reply) =
+            xproto::get_property(connection, false, root, active_atom, AtomEnum::WINDOW, 0, 1)
+                .ok()?
+                .reply()
+        {
+            if let Some(active) = reply.value32().and_then(|mut values| values.next()) {
+                window = active;
+            }
+        }
+    }
+    if window == x11rb::NONE {
+        // No EWMH property (no window manager, or the manager is starting):
+        // fall back to the server's input focus.
+        window = xproto::get_input_focus(connection)
+            .ok()?
+            .reply()
+            .ok()?
+            .focus;
+    }
+    if window == x11rb::NONE || window == 1 {
+        return Some(false);
+    }
+    Some(window_is_terminal(connection, window, 8))
+}
+
+/// A terminal WM_CLASS is matched exactly or by the last reverse-DNS
+/// component: WezTerm uses `org.wezfurlong.wezterm` and Warp uses
+/// `dev.warp.Warp`.
+#[cfg(feature = "desktop")]
+fn is_terminal_class(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    TERMINAL_CLASSES.contains(&lower.as_str())
+        || lower
+            .rsplit('.')
+            .next()
+            .is_some_and(|tail| TERMINAL_CLASSES.contains(&tail))
+}
+
+/// Check a window and, for focus children without WM_CLASS, its ancestors.
+#[cfg(feature = "desktop")]
+fn window_is_terminal(
+    connection: &impl x11rb::connection::Connection,
+    window: u32,
+    depth: u8,
+) -> bool {
+    use x11rb::protocol::xproto::{self, AtomEnum};
+
+    if window == x11rb::NONE || depth == 0 {
+        return false;
+    }
+    let class = xproto::get_property(
+        connection,
+        false,
+        window,
+        AtomEnum::WM_CLASS,
+        AtomEnum::STRING,
+        0,
+        1024,
+    )
+    .ok()
+    .and_then(|cookie| cookie.reply().ok());
+    if let Some(class) = class {
+        let text = String::from_utf8_lossy(&class.value);
+        let names: Vec<&str> = text.split('\0').filter(|part| !part.is_empty()).collect();
+        if !names.is_empty() {
+            return names.iter().any(|name| is_terminal_class(name));
+        }
+    }
+    let Some(tree) = xproto::query_tree(connection, window)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+    else {
+        return false;
+    };
+    tree.parent != x11rb::NONE
+        && tree.parent != window
+        && window_is_terminal(connection, tree.parent, depth - 1)
 }
 
 /// Whether the desktop is locked. Unknown state counts as unlocked so a host
@@ -548,5 +759,146 @@ mod tests {
         // DPMS force-on plus the zero-motion XTest event must both resolve.
         wake_display_blocking(Some(&display)).expect("X11 display wake");
         session.stop();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Xvfb"]
+    async fn xvfb_terminal_focus_detection() {
+        use x11rb::connection::Connection;
+        use x11rb::protocol::xproto::{self, AtomEnum, PropMode};
+
+        let (_server, display) = start_xvfb(320, 240);
+        let (connection, screen_num) = x11rb::connect(Some(&display)).unwrap();
+        let root = connection.setup().roots[screen_num].root;
+        let window = connection.generate_id().unwrap();
+        xproto::create_window(
+            &connection,
+            x11rb::COPY_DEPTH_FROM_PARENT,
+            window,
+            root,
+            0,
+            0,
+            10,
+            10,
+            0,
+            xproto::WindowClass::INPUT_OUTPUT,
+            x11rb::COPY_FROM_PARENT,
+            &xproto::CreateWindowAux::new(),
+        )
+        .unwrap();
+        let active_atom = xproto::intern_atom(&connection, false, b"_NET_ACTIVE_WINDOW")
+            .unwrap()
+            .reply()
+            .unwrap()
+            .atom;
+        let set_class = |class: &[u8]| {
+            xproto::change_property(
+                &connection,
+                PropMode::REPLACE,
+                window,
+                AtomEnum::WM_CLASS,
+                AtomEnum::STRING,
+                8,
+                class.len() as u32,
+                class,
+            )
+            .unwrap();
+            connection.flush().unwrap();
+        };
+        let set_active = |active: u32| {
+            xproto::change_property(
+                &connection,
+                PropMode::REPLACE,
+                root,
+                active_atom,
+                AtomEnum::WINDOW,
+                32,
+                1,
+                &active.to_le_bytes(),
+            )
+            .unwrap();
+            connection.flush().unwrap();
+        };
+        set_class(b"xterm\0XTerm");
+        set_active(window);
+        assert_eq!(query_terminal_focus_on(Some(&display)), Some(true));
+        // Reverse-DNS WM_CLASS names must still match by their last component.
+        set_class(b"org.wezfurlong.wezterm\0org.wezfurlong.wezterm");
+        assert_eq!(query_terminal_focus_on(Some(&display)), Some(true));
+        set_class(b"example\0Example");
+        assert_eq!(query_terminal_focus_on(Some(&display)), Some(false));
+        // Another terminal-class window elsewhere must not affect the answer.
+        let other = connection.generate_id().unwrap();
+        xproto::create_window(
+            &connection,
+            x11rb::COPY_DEPTH_FROM_PARENT,
+            other,
+            root,
+            0,
+            0,
+            10,
+            10,
+            0,
+            xproto::WindowClass::INPUT_OUTPUT,
+            x11rb::COPY_FROM_PARENT,
+            &xproto::CreateWindowAux::new(),
+        )
+        .unwrap();
+        xproto::change_property(
+            &connection,
+            PropMode::REPLACE,
+            other,
+            AtomEnum::WM_CLASS,
+            AtomEnum::STRING,
+            8,
+            b"xterm\0XTerm".len() as u32,
+            b"xterm\0XTerm",
+        )
+        .unwrap();
+        connection.flush().unwrap();
+        assert_eq!(query_terminal_focus_on(Some(&display)), Some(false));
+        // Without _NET_ACTIVE_WINDOW the server input focus is used; a focus
+        // child without WM_CLASS inherits its parent's class.
+        let child = connection.generate_id().unwrap();
+        xproto::create_window(
+            &connection,
+            x11rb::COPY_DEPTH_FROM_PARENT,
+            child,
+            other,
+            0,
+            0,
+            5,
+            5,
+            0,
+            xproto::WindowClass::INPUT_OUTPUT,
+            x11rb::COPY_FROM_PARENT,
+            &xproto::CreateWindowAux::new(),
+        )
+        .unwrap();
+        xproto::map_window(&connection, other).unwrap();
+        xproto::map_window(&connection, child).unwrap();
+        xproto::delete_property(&connection, root, active_atom).unwrap();
+        xproto::set_input_focus(
+            &connection,
+            xproto::InputFocus::NONE,
+            child,
+            x11rb::CURRENT_TIME,
+        )
+        .unwrap();
+        connection.flush().unwrap();
+        assert_eq!(query_terminal_focus_on(Some(&display)), Some(true));
+        xproto::set_input_focus(
+            &connection,
+            xproto::InputFocus::NONE,
+            x11rb::NONE,
+            x11rb::CURRENT_TIME,
+        )
+        .unwrap();
+        set_active(0);
+        assert_eq!(query_terminal_focus_on(Some(&display)), Some(false));
+        xproto::destroy_window(&connection, child).unwrap();
+        xproto::destroy_window(&connection, window).unwrap();
+        xproto::destroy_window(&connection, other).unwrap();
+        connection.flush().unwrap();
     }
 }
