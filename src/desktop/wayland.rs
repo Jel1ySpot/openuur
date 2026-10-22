@@ -265,6 +265,7 @@ pub async fn start(options: DesktopOptions) -> Result<DesktopSession, String> {
         input,
         stop,
         task,
+        wake: None,
         clipboard: std::sync::Mutex::new(clipboard),
     })
 }

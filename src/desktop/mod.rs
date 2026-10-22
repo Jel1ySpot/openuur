@@ -34,6 +34,8 @@ mod uinput_scroll;
 mod unsupported;
 #[cfg(all(target_os = "linux", feature = "desktop"))]
 mod wayland;
+#[cfg(all(target_os = "linux", feature = "desktop"))]
+mod wlroots;
 #[cfg(target_os = "linux")]
 mod x11;
 
@@ -63,15 +65,12 @@ impl Backend {
         }
     }
 
-    /// Whether this build can actually capture with the backend today. The
-    /// native wlroots backend lands in a later phase; selecting it still
-    /// reports the intended backend, but desktop offers are rejected until
-    /// then.
+    /// Whether this build can actually capture with the backend today.
     pub fn implemented(self) -> bool {
         match self {
             Self::Wayland => cfg!(all(target_os = "linux", feature = "desktop")),
             Self::X11 => cfg!(all(target_os = "linux", feature = "desktop")),
-            Self::Wlroots => false,
+            Self::Wlroots => cfg!(all(target_os = "linux", feature = "desktop")),
         }
     }
 }
@@ -133,30 +132,54 @@ pub fn select_backend(choice: BackendChoice, session: &SessionEnv) -> Backend {
     }
 }
 
-/// The native wlroots backend ships in a later phase. Auto selection keeps
-/// wlroots desktops working through the portal (which already worked before
-/// this phase); an explicit `wlroots` request must fail instead of silently
-/// changing backend.
+/// The selected backend, without fallback. Auto resolves to wlroots for
+/// non-GNOME/KDE Wayland sessions and to X11 for Xorg sessions.
 pub fn effective_selection(choice: BackendChoice, session: &SessionEnv) -> BackendSelection {
     let requested = select_backend(choice, session);
-    if choice == BackendChoice::Auto && requested == Backend::Wlroots {
-        BackendSelection {
-            requested,
-            effective: Backend::Wayland,
-            fallback: true,
-        }
+    BackendSelection {
+        requested,
+        effective: requested,
+        fallback: false,
+    }
+}
+
+/// Resolve the backend for the requested capture source.
+///
+/// Only the portal can capture a window or a compositor virtual source. Auto
+/// therefore falls back to the portal for those sources on a wlroots desktop;
+/// an explicit wlroots request fails with an actionable message.
+pub fn backend_for_source(
+    selection: BackendSelection,
+    source: SourceKind,
+    automatic: bool,
+) -> Result<Backend, String> {
+    if selection.effective != Backend::Wlroots || source == SourceKind::Monitor {
+        return Ok(selection.effective);
+    }
+    if automatic {
+        Ok(Backend::Wayland)
     } else {
-        BackendSelection {
-            requested,
-            effective: requested,
-            fallback: false,
-        }
+        Err("the native wlroots backend captures whole outputs; use \
+             --desktop-backend portal for window or virtual sources"
+            .to_owned())
     }
 }
 
 /// Resolve the selected backend from the current graphical session.
 pub async fn detect_backend(choice: BackendChoice) -> Result<Backend, String> {
     Ok(detect_backend_selection(choice).await?.0.effective)
+}
+
+/// Check that the active compositor exposes the native wlroots protocols.
+pub(crate) fn probe_wlroots() -> Result<(), String> {
+    #[cfg(all(target_os = "linux", feature = "desktop"))]
+    {
+        wlroots::probe()
+    }
+    #[cfg(not(all(target_os = "linux", feature = "desktop")))]
+    {
+        Err("this build has no wlroots support".to_owned())
+    }
 }
 
 pub async fn detect_backend_selection(
@@ -381,6 +404,8 @@ pub struct DesktopSession {
     input: Arc<dyn InputSink>,
     stop: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
+    /// Backend-specific display wake (wlroots output power).
+    wake: Option<Arc<dyn Fn() + Send + Sync>>,
     clipboard: std::sync::Mutex<Option<clipboard::ClipboardBridge>>,
 }
 
@@ -462,6 +487,9 @@ impl DesktopSession {
 
     /// Wake the display using this session's backend.
     pub async fn wake(&self) {
+        if let Some(wake) = &self.wake {
+            wake();
+        }
         if let Err(error) = desktop_power::wake_backend(self.backend).await {
             tracing::debug!("desktop wake failed: {error}");
         }
@@ -497,9 +525,7 @@ pub async fn start_with(
         #[cfg(all(target_os = "linux", feature = "desktop"))]
         Backend::Wayland => wayland::start(options).await,
         #[cfg(all(target_os = "linux", feature = "desktop"))]
-        Backend::Wlroots => Err("native wlroots capture is not implemented until Phase 8; \
-             use --desktop-backend portal or auto"
-            .to_owned()),
+        Backend::Wlroots => wlroots::start(options).await,
         #[cfg(all(target_os = "linux", not(feature = "desktop")))]
         Backend::Wayland | Backend::Wlroots => {
             let _ = options;
@@ -586,20 +612,41 @@ mod tests {
     }
 
     #[test]
-    fn auto_wlroots_falls_back_until_the_native_backend_exists() {
+    fn auto_uses_the_native_backend_for_wlroots_desktops() {
         let selection = effective_selection(
             BackendChoice::Auto,
             &env(SessionType::Wayland, DesktopKind::Other),
         );
         assert_eq!(selection.requested, Backend::Wlroots);
-        assert_eq!(selection.effective, Backend::Wayland);
-        assert!(selection.fallback);
+        assert_eq!(selection.effective, Backend::Wlroots);
+        assert!(!selection.fallback);
         // Portal desktops never report a fallback.
         let selection = effective_selection(
             BackendChoice::Auto,
             &env(SessionType::Wayland, DesktopKind::Kde),
         );
+        assert_eq!(selection.effective, Backend::Wayland);
         assert!(!selection.fallback);
+    }
+
+    #[test]
+    fn window_sources_use_the_portal_on_wlroots_desktops() {
+        let session = env(SessionType::Wayland, DesktopKind::Other);
+        let selection = effective_selection(BackendChoice::Auto, &session);
+        assert_eq!(
+            backend_for_source(selection, SourceKind::Monitor, true),
+            Ok(Backend::Wlroots)
+        );
+        assert_eq!(
+            backend_for_source(selection, SourceKind::Window, true),
+            Ok(Backend::Wayland)
+        );
+        assert!(backend_for_source(selection, SourceKind::Virtual, false).is_err());
+        let portal = effective_selection(BackendChoice::Portal, &session);
+        assert_eq!(
+            backend_for_source(portal, SourceKind::Window, false),
+            Ok(Backend::Wayland)
+        );
     }
 
     #[test]

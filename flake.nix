@@ -49,6 +49,7 @@
               clippy
               pkg-config
               pipewire.dev
+              libxkbcommon
               openssl
               clang
               llvmPackages.libclang
@@ -62,6 +63,10 @@
               pkgs.openssl.dev
             ];
             BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.stdenv.cc.libc.dev}/include";
+            # Cargo does not read Nix's NIX_LDFLAGS, so point rustc at the
+            # libraries the wayland/keymap backend links against.
+            LIBRARY_PATH = lib.makeLibraryPath [ pkgs.libxkbcommon ];
+            LD_LIBRARY_PATH = lib.makeLibraryPath [ pkgs.libxkbcommon ];
 
             shellHook = ''
               echo "openuur dev shell"

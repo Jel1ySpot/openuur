@@ -10,10 +10,10 @@ default-run = "openuur"
 
 [features]
 default = ["desktop"]
-# Wayland capture through xdg-desktop-portal + PipeWire. Disable it with
-# `--no-default-features` to build a terminal-only host without PipeWire or
-# libclang development headers.
-desktop = ["dep:lamco-pipewire", "dep:x11rb"]
+# Wayland capture (xdg-desktop-portal + native wlroots) and X11. Disable it
+# with `--no-default-features` to build a terminal-only host without PipeWire,
+# libxkbcommon or libclang development headers.
+desktop = ["dep:lamco-pipewire", "dep:x11rb", "dep:wayland-client", "dep:wayland-protocols", "dep:wayland-protocols-wlr", "dep:wayland-scanner", "dep:wayland-backend", "dep:xkbcommon"]
 
 [lib]
 name = "openuur"
@@ -67,6 +67,12 @@ lamco-portal = "0.4"
 lamco-pipewire = { version = "0.8", default-features = false, optional = true }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 x11rb = { version = "0.13", features = ["dpms", "xtest", "randr", "damage", "shm", "xfixes"], optional = true }
+wayland-client = { version = "0.31", optional = true }
+wayland-protocols = { version = "0.32", features = ["client", "unstable"], optional = true }
+wayland-protocols-wlr = { version = "0.3", features = ["client"], optional = true }
+wayland-scanner = { version = "0.31", optional = true }
+wayland-backend = { version = "0.3", optional = true }
+xkbcommon = { version = "0.8", optional = true }
 
 
 # UU interop needs the post-handshake DTLS delivery fix from this vendored 0.9.0 copy.

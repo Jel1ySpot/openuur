@@ -4,6 +4,7 @@
   stdenv,
   pkg-config,
   makeWrapper,
+  libxkbcommon,
   pipewire,
   llvmPackages,
   pam,
@@ -65,6 +66,7 @@ rustPlatform.buildRustPackage {
   ];
 
   buildInputs = [
+    libxkbcommon
     pipewire
     pipewire.dev
     llvmPackages.libclang

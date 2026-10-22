@@ -6,24 +6,25 @@
 
 ### 1. 安装二进制
 
-`cargo install` 可以安装到 `~/.cargo/bin`。默认构建包含 Wayland portal 与 X11 桌面采集，需要 PipeWire/SPA 开发头文件和 libclang：
+`cargo install` 可以安装到 `~/.cargo/bin`。默认构建包含 Wayland portal、原生 wlroots 与 X11 桌面采集，需要 PipeWire/SPA、libxkbcommon 开发头文件和 libclang：
 
 ```bash
 # Debian / Ubuntu
 sudo apt install build-essential pkg-config clang libclang-dev \
-  libpipewire-0.3-dev libspa-0.2-dev \
+  libpipewire-0.3-dev libspa-0.2-dev libxkbcommon-dev xkb-data \
   ffmpeg xdg-desktop-portal libpam0g wireplumber wl-clipboard
 # 按桌面环境再安装对应 portal 后端：
 #   xdg-desktop-portal-gnome / xdg-desktop-portal-kde / xdg-desktop-portal-wlr
 
 # Fedora（ffmpeg 需启用 RPM Fusion）
 sudo dnf install gcc pkgconf-pkg-config clang clang-devel pipewire-devel \
+  libxkbcommon-devel xkeyboard-config \
   ffmpeg xdg-desktop-portal pam wireplumber wl-clipboard
 # 按桌面环境再安装对应 portal 后端：
 #   xdg-desktop-portal-gnome / xdg-desktop-portal-kde / xdg-desktop-portal-wlr
 
 # Arch
-sudo pacman -S base-devel pkgconf clang pipewire \
+sudo pacman -S base-devel pkgconf clang pipewire libxkbcommon xkeyboard-config \
   ffmpeg xdg-desktop-portal pam wireplumber wl-clipboard
 # 按桌面环境再安装对应 portal 后端：
 #   xdg-desktop-portal-gnome / xdg-desktop-portal-kde / xdg-desktop-portal-wlr
@@ -54,7 +55,8 @@ openuur install          # 用户级 systemd 服务
 运行时依赖：
 
 - `ffmpeg`：视频编码
-- `xdg-desktop-portal` 及对应桌面后端（`xdg-desktop-portal-gnome` / `xdg-desktop-portal-kde` / `xdg-desktop-portal-wlr`）：Wayland 屏幕采集与远程输入（X11 会话直接使用 X 协议，不需要 portal）
+- `xdg-desktop-portal` 及对应桌面后端（`xdg-desktop-portal-gnome` / `xdg-desktop-portal-kde` / `xdg-desktop-portal-wlr`）：GNOME/KDE Wayland 的屏幕采集与远程输入；wlroots 桌面（Sway/Hyprland 等）默认走原生协议，不需要 portal
+- `libxkbcommon` + `xkeyboard-config`：原生 wlroots 键盘输入（编译与运行时）
 - `libpam`：锁屏自动解锁
 - `wireplumber`：提供 `wpctl`，用于静音运行
 - `wl-clipboard`：文本剪贴板
@@ -273,7 +275,7 @@ nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#pkg-config nixpkgs#openssl \
 cargo build --release --no-default-features
 ```
 
-运行时还需要 `ffmpeg`（含 `libx264`）；Wayland 会话还需要 `xdg-desktop-portal` 和对应桌面后端（KDE/GNOME/wlroots），X11 会话不需要。
+运行时还需要 `ffmpeg`（含 `libx264`）；GNOME/KDE Wayland 会话还需要 `xdg-desktop-portal` 和对应桌面后端，wlroots 桌面（Sway/Hyprland）使用原生协议并需要 `libxkbcommon`/`xkeyboard-config`，X11 会话不需要。
 
 产物：
 
@@ -287,8 +289,10 @@ target/release/openuurd
 | 功能 | 说明 |
 |---|---|
 | 多显示器 | portal 一次授权多个 monitor；官方客户端通过 `CaptureConfig.screen_id` 切换 |
-| 采集后端 | `openuurd run --desktop-backend auto\|portal\|wlroots\|x11`、`UU_DESKTOP_BACKEND`；auto 按会话类型选择（GNOME/KDE Wayland → portal，其它 Wayland → wlroots，X11 → x11）；原生 wlroots 尚未落地，auto 选中 wlroots 时暂用 portal |
+| 采集后端 | `openuurd run --desktop-backend auto\|portal\|wlroots\|x11`、`UU_DESKTOP_BACKEND`；auto 按会话类型选择（GNOME/KDE Wayland → portal，其它 Wayland → wlroots，X11 → x11）。wlroots 不可用（例如脚本自启动的合成器未暴露 wlr 协议）时，auto 回退 portal 并记录日志；显式 `wlroots` 则直接报错 |
+| wlroots 后端 | 直接使用 `zwlr_screencopy_manager_v1`（wl_shm 双缓冲、Y_INVERT/XBGR/ABGR 转换）、`zwlr_virtual_pointer_v1`、`zwp_virtual_keyboard_v1`（xkbcommon keymap、修饰键序列化、文本临时 keycode）与 `zwlr_output_power_manager_v1` 唤醒；锁屏/挂起时停帧并释放输入；不支持窗口/虚拟源与光标形状，旋转输出以合成器返回的缓冲区尺寸为准 |
 | X11 后端 | XDamage + MIT-SHM 采集（缺 DAMAGE/SHM 时退化轮询或 `GetImage`）、XTest 绝对/相对指针与按键、120 单位滚轮、临时 keycode 文本输入、XFixes 光标形状同步（serial 去重、≤30 Hz、PNG）、RandR 活动显示器切换；窗口/虚拟源仍请使用 portal；X11 会话暂不支持文本剪贴板 |
+| 快捷键映射 | macOS 控制端的 Cmd+C/V/A/F/X/Z 映射为 Ctrl（聚焦终端内 Cmd+C/V 为 Ctrl+Shift），其余 Cmd 组合与单独 Cmd 保持 Super；X11 终端内 Ctrl+V 自动变为 Ctrl+Shift+V；`UU_MAC_SHORTCUTS=0\|1` 强制控制端类型，`UU_TERMINAL_SHORTCUTS=0` 关闭终端转换 |
 | 会话发现 | 系统服务通过 logind 找到账号的活动图形会话，投影 `WAYLAND_DISPLAY`/`DISPLAY`/`XDG_RUNTIME_DIR`/session bus 等 7 个变量；每 2 秒复查，会话切换只断开桌面 peer，终端/文件/端口映射保留；没有会话时明确报「等待图形会话」 |
 | 显示源 | `openuurd display source monitor\|window\|virtual`，或 `openuurd run --display-source ...` / `UU_DISPLAY_SOURCE` |
 | 分辨率 | 编码器缩放，不修改宿主机显示模式；显示配置变化时重建采集并保留编码尺寸 |

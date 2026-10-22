@@ -121,6 +121,7 @@ pub(crate) async fn start_at_with(
         input,
         stop,
         task,
+        wake: None,
         clipboard: Mutex::new(None),
     })
 }

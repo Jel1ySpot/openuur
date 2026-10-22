@@ -362,15 +362,41 @@ fn remember_connect(
                 // The monitor is the sole writer of the projected environment;
                 // re-applying here could revert a newer session it just applied.
                 let selection = desktop::effective_selection(choice, &session);
-                if selection.fallback {
+                // Auto keeps non-GNOME/KDE Wayland sessions working through
+                // the portal when the compositor lacks the wlr protocols;
+                // an explicit wlroots request fails instead.
+                let resolved = desktop::backend_for_source(
+                    selection,
+                    options.source,
+                    choice == desktop::BackendChoice::Auto,
+                )?;
+                if resolved != selection.effective {
                     tracing::warn!(
-                        "native wlroots capture is not implemented until Phase 8; \
-                         using xdg-desktop-portal"
+                        "native wlroots capture is output-only; \
+                         using xdg-desktop-portal for this source"
                     );
                 }
-                let desktop = desktop::start_with(selection.effective, options)
-                    .await
-                    .map(Arc::new)?;
+                let backend = if resolved == desktop::Backend::Wlroots {
+                    match tokio::task::spawn_blocking(desktop::probe_wlroots).await {
+                        Ok(Ok(())) => desktop::Backend::Wlroots,
+                        Ok(Err(error)) if choice == desktop::BackendChoice::Auto => {
+                            tracing::warn!(
+                                "native wlroots capture unavailable ({error}); \
+                                 using xdg-desktop-portal"
+                            );
+                            desktop::Backend::Wayland
+                        }
+                        Ok(Err(error)) => {
+                            return Err(format!("wlroots backend unavailable: {error}"))
+                        }
+                        Err(error) => {
+                            return Err(format!("wlroots capability probe failed: {error}"))
+                        }
+                    }
+                } else {
+                    resolved
+                };
+                let desktop = desktop::start_with(backend, options).await.map(Arc::new)?;
                 // A session change while the portal was starting must not
                 // attach a stale capture to a later offer.
                 if session_env::current().map(|env| env.identity()) != Some(session.identity()) {
