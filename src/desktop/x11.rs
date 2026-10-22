@@ -51,6 +51,7 @@ pub(crate) fn wake_display_blocking(display: Option<&str>) -> Result<(), String>
 }
 
 #[cfg(not(feature = "desktop"))]
+#[allow(dead_code)] // desktop_power's X11 wake branch is compiled out too
 pub(crate) fn wake_display_blocking(_display: Option<&str>) -> Result<(), String> {
     Ok(())
 }

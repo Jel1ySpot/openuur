@@ -287,6 +287,8 @@ target/release/openuurd
 | 功能 | 说明 |
 |---|---|
 | 多显示器 | portal 一次授权多个 monitor；官方客户端通过 `CaptureConfig.screen_id` 切换 |
+| 采集后端 | `openuurd run --desktop-backend auto\|portal\|wlroots\|x11`、`UU_DESKTOP_BACKEND`；auto 按会话类型选择（GNOME/KDE Wayland → portal，其它 Wayland → wlroots，X11 → x11）；原生 wlroots 与 X11 后端尚未落地，auto 选中 wlroots 时暂用 portal，X11 桌面请求会明确拒绝 |
+| 会话发现 | 系统服务通过 logind 找到账号的活动图形会话，投影 `WAYLAND_DISPLAY`/`DISPLAY`/`XDG_RUNTIME_DIR`/session bus 等 7 个变量；每 2 秒复查，会话切换只断开桌面 peer，终端/文件/端口映射保留；没有会话时明确报「等待图形会话」 |
 | 显示源 | `openuurd display source monitor\|window\|virtual`，或 `openuurd run --display-source ...` / `UU_DISPLAY_SOURCE` |
 | 分辨率 | 编码器缩放，不修改宿主机显示模式；显示配置变化时重建采集并保留编码尺寸 |
 | H.264/H.265 | `UU_VIDEO_CODEC=h264\|h265`；默认跟随官方协商 |

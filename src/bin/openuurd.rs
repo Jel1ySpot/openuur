@@ -52,6 +52,11 @@ struct RunArgs {
     /// Portal capture source: monitor (default), window or virtual.
     #[arg(long, env = "UU_DISPLAY_SOURCE")]
     display_source: Option<String>,
+    /// Capture backend: auto (default), portal, wlroots or x11. Persisted to
+    /// the config file; `UU_DESKTOP_BACKEND` applies when the file has no
+    /// value.
+    #[arg(long)]
+    desktop_backend: Option<String>,
     /// Directory the viewer's file window opens on and receives into.
     #[arg(long, env = "UU_FILE_SAVE_PATH")]
     file_save_path: Option<PathBuf>,
@@ -97,6 +102,12 @@ async fn real_main() -> anyhow::Result<()> {
                 config.display_source = Some(source);
                 changed = true;
             }
+            if let Some(backend) = args.desktop_backend {
+                let choice =
+                    openuur::desktop::BackendChoice::parse(&backend).map_err(anyhow::Error::msg)?;
+                config.desktop_backend = Some(choice.as_str().to_owned());
+                changed = true;
+            }
             if let Some(path) = args.file_save_path {
                 config.file_save_path = Some(path.to_string_lossy().into_owned());
                 changed = true;
@@ -116,8 +127,11 @@ async fn real_main() -> anyhow::Result<()> {
             let device_id = config.ensure_device_id()?;
             let device_name = config.ensure_device_name();
             println!("openuurd device: {device_name} ({device_id})");
-            match openuur::desktop::detect_backend() {
-                Ok(backend) => println!("desktop capture: {backend:?}"),
+            match openuur::desktop::detect_backend_selection(config.desktop_backend()).await {
+                Ok((selection, session)) => {
+                    println!("desktop session: {}", session.describe());
+                    println!("desktop capture: {}", capture_line(selection));
+                }
                 Err(error) => println!("desktop capture: unavailable ({error})"),
             }
             openuur::uu_native::host::run(config, args.password).await?;
@@ -128,13 +142,17 @@ async fn real_main() -> anyhow::Result<()> {
             println!("api_base: {}", config.api_base);
             println!("user_id: {}", config.user_id.as_deref().unwrap_or("-"));
             println!("device: {device_name} ({device_id})");
-            println!(
-                "desktop: {}",
-                match openuur::desktop::detect_backend() {
-                    Ok(backend) => format!("{backend:?}"),
-                    Err(error) => format!("unavailable ({error})"),
+            println!("desktop backend: {}", config.desktop_backend().as_str());
+            match openuur::desktop::detect_backend_selection(config.desktop_backend()).await {
+                Ok((selection, session)) => {
+                    println!("desktop session: {}", session.describe());
+                    println!("desktop capture: {}", capture_line(selection));
                 }
-            );
+                Err(error) => {
+                    println!("desktop session: {error}");
+                    println!("desktop capture: unavailable");
+                }
+            }
             println!("display source: {}", config.display_source().as_str());
             println!("file save path: {}", config.file_save_path().display());
             println!(
@@ -162,6 +180,21 @@ async fn real_main() -> anyhow::Result<()> {
         },
     }
     Ok(())
+}
+
+/// One line that never presents an unimplemented backend as usable.
+fn capture_line(selection: openuur::desktop::BackendSelection) -> String {
+    let backend = selection.effective.label();
+    if !selection.effective.implemented() {
+        return format!("{backend} (backend not implemented yet; desktop offers will be rejected)");
+    }
+    if selection.fallback {
+        return format!(
+            "{backend} ({} requested; native backend not implemented)",
+            selection.requested.label()
+        );
+    }
+    backend.to_owned()
 }
 
 fn init_logging(verbose: bool) {

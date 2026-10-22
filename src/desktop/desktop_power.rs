@@ -22,10 +22,21 @@ pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// GNOME with a graphical session. Other desktops are left untouched.
 pub fn gnome_active() -> bool {
-    gnome_desktop() && std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some()
+    let bus = match super::session_env::current() {
+        Some(env) => !env.bus_address.is_empty(),
+        None => std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some(),
+    };
+    gnome_desktop() && bus
 }
 
 fn gnome_desktop() -> bool {
+    if let Some(env) = super::session_env::current() {
+        return env.desktop == super::session_env::DesktopKind::Gnome;
+    }
+    // After a real session loss, do not fall back to a stale unit environment.
+    if super::session_env::authoritative() {
+        return false;
+    }
     std::env::var("XDG_CURRENT_DESKTOP")
         .unwrap_or_default()
         .split(':')
@@ -147,6 +158,12 @@ async fn screensaver_wake() -> Result<(), String> {
 
 #[cfg(all(target_os = "linux", feature = "desktop"))]
 fn x11_session() -> bool {
+    if let Some(env) = super::session_env::current() {
+        return env.session_type == super::session_env::SessionType::X11;
+    }
+    if super::session_env::authoritative() {
+        return false;
+    }
     std::env::var_os("DISPLAY").is_some()
         && std::env::var("XDG_SESSION_TYPE").as_deref() != Ok("wayland")
 }

@@ -58,6 +58,9 @@ pub struct Config {
     /// What the portal is allowed to capture: monitor, window or virtual.
     #[serde(default)]
     pub display_source: Option<String>,
+    /// Capture backend preference: auto, portal, wlroots or x11.
+    #[serde(default)]
+    pub desktop_backend: Option<String>,
     /// Directory the viewer's file-transfer window opens on and receives into.
     #[serde(default)]
     pub file_save_path: Option<String>,
@@ -77,6 +80,7 @@ impl Default for Config {
             upload_url: None,
             shell: None,
             display_source: None,
+            desktop_backend: None,
             file_save_path: None,
         }
     }
@@ -244,6 +248,17 @@ impl Config {
             .or_else(|| std::env::var("UU_DISPLAY_SOURCE").ok())
             .unwrap_or_else(|| "monitor".to_owned());
         crate::desktop::SourceKind::parse(&configured).unwrap_or_default()
+    }
+
+    /// Capture backend preference. The config file wins over the environment,
+    /// matching `display_source`.
+    pub fn desktop_backend(&self) -> crate::desktop::BackendChoice {
+        let configured = self
+            .desktop_backend
+            .clone()
+            .or_else(|| std::env::var("UU_DESKTOP_BACKEND").ok())
+            .unwrap_or_else(|| "auto".to_owned());
+        crate::desktop::BackendChoice::parse(&configured).unwrap_or_default()
     }
 }
 

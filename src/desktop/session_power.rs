@@ -19,9 +19,9 @@ use zbus::zvariant::OwnedFd;
 
 use super::desktop_power::CALL_TIMEOUT;
 
-const LOGIND_DEST: &str = "org.freedesktop.login1";
-const LOGIND_PATH: &str = "/org/freedesktop/login1";
-const LOGIND_IFACE: &str = "org.freedesktop.login1.Manager";
+pub(crate) const LOGIND_DEST: &str = "org.freedesktop.login1";
+pub(crate) const LOGIND_PATH: &str = "/org/freedesktop/login1";
+pub(crate) const LOGIND_IFACE: &str = "org.freedesktop.login1.Manager";
 /// Upper bound on the whole asynchronous setup, including bus handshakes that
 /// are not covered by a single call timeout.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(10);

@@ -10,6 +10,7 @@ use super::system_metrics::Permission;
 use super::term::{self, HostTerminal};
 use super::wire;
 use crate::config::Config;
+use crate::desktop::session_env::{self, SessionIdentity};
 use crate::desktop::{self, DesktopOptions, DesktopSession, InputSink};
 use crate::error::{Error, Result};
 use crate::terminal::session::SessionManager;
@@ -30,6 +31,12 @@ struct Route {
     app: String,
 }
 
+/// A capture plus the login session it belongs to.
+struct StartedDesktop {
+    desktop: Arc<DesktopSession>,
+    session: session_env::SessionEnv,
+}
+
 struct Pending {
     capture_type: u64,
     ice: Option<String>,
@@ -37,8 +44,7 @@ struct Pending {
     app: String,
     header: Value,
     created_at: std::time::Instant,
-    desktop:
-        Option<tokio::sync::oneshot::Receiver<std::result::Result<Arc<DesktopSession>, String>>>,
+    desktop: Option<tokio::sync::oneshot::Receiver<std::result::Result<StartedDesktop, String>>>,
 }
 
 /// Process-lifetime host state. Signaling rooms reconnect underneath it, but
@@ -59,6 +65,9 @@ struct HostPeer {
     pc: Arc<webrtc::peer_connection::RTCPeerConnection>,
     route: Route,
     desktop: Option<Arc<DesktopSession>>,
+    /// Set exactly for desktop peers; used to close captures that belong to a
+    /// session which no longer exists.
+    session: Option<SessionIdentity>,
     actions: Arc<PeerActions>,
     stopped: AtomicBool,
     /// One reference on the process-wide sleep inhibitor. Released by normal
@@ -110,6 +119,9 @@ impl HostPeer {
 pub async fn run(config: Config, password: Option<String>) -> Result<()> {
     crate::desktop::virtual_audio::init();
     let _virtual_audio = crate::desktop::virtual_audio::Cleanup;
+    // Discover the login session even before the first peer so a system
+    // service can serve desktop offers as soon as the user logs in.
+    session_env::ensure_monitor();
     let mut runtime = HostRuntime {
         manager: SessionManager::new(password),
         peers: HashMap::new(),
@@ -125,7 +137,25 @@ pub async fn run(config: Config, password: Option<String>) -> Result<()> {
                 if connected {
                     backoff = Duration::from_secs(3);
                 }
-                tokio::time::sleep(backoff).await;
+                // Session changes still invalidate desktop captures while
+                // signaling is down, so a dead compositor is not held pinned
+                // through the whole backoff.
+                let deadline = tokio::time::Instant::now() + backoff;
+                let mut session_rx = session_env::subscribe();
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(deadline) => break,
+                        changed = session_rx.changed() => {
+                            if changed.is_err() {
+                                tokio::time::sleep_until(deadline).await;
+                                break;
+                            }
+                            let current = session_rx.borrow_and_update().available().cloned();
+                            close_desktop_peers(&mut runtime, current.as_ref()).await;
+                            cancel_pending_desktop(&mut runtime);
+                        }
+                    }
+                }
                 backoff = (backoff * 2).min(Duration::from_secs(30));
             }
         }
@@ -165,6 +195,10 @@ async fn enter_room(config: &Config, runtime: &mut HostRuntime) -> RoomExit {
 async fn room_loop(config: &Config, runtime: &mut HostRuntime, signal: &mut Signal) -> RoomExit {
     let mut tick = tokio::time::interval(Duration::from_secs(2));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut session_rx = session_env::subscribe();
+    // Apply a session change that happened while signaling was disconnected.
+    let current = session_rx.borrow_and_update().available().cloned();
+    close_desktop_peers(runtime, current.as_ref()).await;
     let mut terminate =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
     let mut interrupt =
@@ -210,6 +244,21 @@ async fn room_loop(config: &Config, runtime: &mut HostRuntime, signal: &mut Sign
                 }
             }
             _ = tick.tick() => maintain(runtime).await,
+            changed = session_rx.changed() => {
+                if changed.is_ok() {
+                    let current = session_rx.borrow_and_update().available().cloned();
+                    match &current {
+                        Some(env) => {
+                            tracing::info!("desktop session changed: {}", env.describe())
+                        }
+                        None => {
+                            tracing::info!("desktop session lost; closing desktop peers")
+                        }
+                    }
+                    close_desktop_peers(runtime, current.as_ref()).await;
+                    cancel_pending_desktop(runtime);
+                }
+            }
             _ = wait_for_shutdown(&mut terminate) => return RoomExit::Shutdown,
             _ = wait_for_shutdown(&mut interrupt) => return RoomExit::Shutdown,
         }
@@ -294,11 +343,31 @@ fn remember_connect(
             source,
             clipboard: true,
         };
+        let choice = config.desktop_backend();
         tokio::spawn(async move {
-            let result = match desktop::detect_backend() {
-                Ok(backend) => desktop::start_with(backend, options).await.map(Arc::new),
-                Err(error) => Err(error),
-            };
+            let result = async {
+                let session = session_env::wait_for_session(session_env::SESSION_WAIT).await?;
+                // The monitor is the sole writer of the projected environment;
+                // re-applying here could revert a newer session it just applied.
+                let selection = desktop::effective_selection(choice, &session);
+                if selection.fallback {
+                    tracing::warn!(
+                        "native wlroots capture is not implemented until Phase 8; \
+                         using xdg-desktop-portal"
+                    );
+                }
+                let desktop = desktop::start_with(selection.effective, options)
+                    .await
+                    .map(Arc::new)?;
+                // A session change while the portal was starting must not
+                // attach a stale capture to a later offer.
+                if session_env::current().map(|env| env.identity()) != Some(session.identity()) {
+                    desktop.stop();
+                    return Err("graphical session changed during capture startup".to_owned());
+                }
+                Ok(StartedDesktop { desktop, session })
+            }
+            .await;
             let _ = tx.send(result);
         });
         Some(rx)
@@ -327,6 +396,7 @@ async fn create_peer(
     route: Route,
     header: &Value,
     desktop: Option<Arc<DesktopSession>>,
+    session: Option<SessionIdentity>,
     capture_type: u64,
     config: &Config,
 ) -> Result<HostPeer> {
@@ -524,6 +594,7 @@ async fn create_peer(
         pc,
         route,
         desktop,
+        session,
         actions,
         stopped: AtomicBool::new(false),
         _power: crate::desktop::session_power::RemoteSessionPower::acquire(),
@@ -1912,7 +1983,7 @@ async fn handle_soac(
                     return;
                 };
                 match tokio::time::timeout(Duration::from_secs(90), receiver).await {
-                    Ok(Ok(Ok(desktop))) => Some(desktop),
+                    Ok(Ok(Ok(started))) => Some(started),
                     Ok(Ok(Err(error))) => {
                         tracing::warn!("native UU desktop capture unavailable: {error}");
                         None
@@ -1933,12 +2004,25 @@ async fn handle_soac(
                 tracing::warn!("native UU desktop offer without a usable capture; rejecting peer");
                 return;
             }
+            if let Some(started) = &desktop {
+                if session_env::current().map(|env| env.identity())
+                    != Some(started.session.identity())
+                {
+                    started.desktop.stop();
+                    tracing::warn!(
+                        "native UU desktop session changed before the offer; rejecting peer"
+                    );
+                    return;
+                }
+            }
+            let session = desktop.as_ref().map(|started| started.session.identity());
             match create_peer(
                 manager,
                 outbox,
                 route.clone(),
                 &header,
-                desktop,
+                desktop.map(|started| started.desktop),
+                session,
                 capture_type,
                 config,
             )
@@ -2011,6 +2095,58 @@ async fn handle_soac(
             }
         }
         _ => {}
+    }
+}
+
+/// A desktop peer belongs to a login session that no longer exists.
+fn desktop_peer_mismatch(
+    has_desktop: bool,
+    session: Option<&SessionIdentity>,
+    current: Option<&SessionIdentity>,
+) -> bool {
+    has_desktop && session != current
+}
+
+fn desktop_peer_keys(
+    peers: &HashMap<String, HostPeer>,
+    current: Option<&session_env::SessionEnv>,
+) -> Vec<String> {
+    let current = current.map(session_env::SessionEnv::identity);
+    peers
+        .iter()
+        .filter(|(_, peer)| {
+            desktop_peer_mismatch(
+                peer.desktop.is_some(),
+                peer.session.as_ref(),
+                current.as_ref(),
+            )
+        })
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
+/// Close only desktop captures whose session changed. Terminal, file, and
+/// port-mapping peers stay connected.
+async fn close_desktop_peers(runtime: &mut HostRuntime, current: Option<&session_env::SessionEnv>) {
+    for key in desktop_peer_keys(&runtime.peers, current) {
+        if let Some(peer) = runtime.peers.remove(&key) {
+            tracing::info!("closing desktop peer {key}: its login session changed");
+            peer.close().await;
+        }
+    }
+}
+
+/// Drop captures that have not finished starting. Each task stops its portal
+/// or PipeWire session when its receiver is gone.
+fn cancel_pending_desktop(runtime: &mut HostRuntime) {
+    let mut cancelled = 0;
+    for pending in &mut runtime.pending {
+        if pending.desktop.take().is_some() {
+            cancelled += 1;
+        }
+    }
+    if cancelled > 0 {
+        tracing::debug!("cancelled {cancelled} pending desktop captures after a session change");
     }
 }
 
@@ -2198,6 +2334,36 @@ mod tests {
         let header = json!({"data":{"ice_id":"i","client_id":"c","app_control_id":"a"}});
         assert_eq!(find_str(&header, &["ice_id"]).as_deref(), Some("i"));
         assert_eq!(find_str(&header, &["client_id"]).as_deref(), Some("c"));
+    }
+
+    fn identity(leader_pid: u32) -> SessionIdentity {
+        SessionIdentity {
+            session_id: "2".to_owned(),
+            session_type: session_env::SessionType::Wayland,
+            display: Some("wayland-0".to_owned()),
+            runtime_dir: "/run/user/1000".into(),
+            bus_address: "unix:path=/run/user/1000/bus".to_owned(),
+            desktop: session_env::DesktopKind::Gnome,
+            leader_pid,
+        }
+    }
+
+    #[test]
+    fn only_mismatched_desktop_peers_are_released() {
+        let old = identity(100);
+        let new = identity(200);
+        // Same session: a desktop capture stays connected.
+        assert!(!desktop_peer_mismatch(true, Some(&old), Some(&old)));
+        // A compositor restart changes the leader pid and invalidates capture.
+        assert!(desktop_peer_mismatch(true, Some(&old), Some(&new)));
+        // Losing the session closes desktop captures...
+        assert!(desktop_peer_mismatch(true, Some(&old), None));
+        // ...but never terminal, file or port-mapping peers.
+        assert!(!desktop_peer_mismatch(false, Some(&old), None));
+        assert!(!desktop_peer_mismatch(false, None, Some(&new)));
+        // A peer without a recorded session cannot be reused safely once a
+        // session appears.
+        assert!(desktop_peer_mismatch(true, None, Some(&new)));
     }
 }
 

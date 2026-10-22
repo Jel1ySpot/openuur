@@ -9,6 +9,8 @@ use std::sync::{Arc, RwLock};
 
 use tokio::sync::watch;
 
+use session_env::{DesktopKind, SessionEnv, SessionType};
+
 pub mod apps;
 pub mod audio;
 pub mod clipboard;
@@ -16,6 +18,7 @@ pub mod desktop_power;
 pub mod encoder;
 pub mod hevc;
 pub mod portal_permissions;
+pub mod session_env;
 pub mod session_lock;
 pub mod session_power;
 pub mod video_track;
@@ -41,8 +44,134 @@ pub struct CapturedFrame {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
+    /// xdg-desktop-portal ScreenCast + RemoteDesktop.
     Wayland,
+    /// Native wlroots protocols (screencopy, virtual pointer/keyboard).
+    Wlroots,
     X11,
+}
+
+impl Backend {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Wayland => "portal",
+            Self::Wlroots => "wlroots",
+            Self::X11 => "x11",
+        }
+    }
+
+    /// Whether this build can actually capture with the backend today. X11
+    /// and native wlroots land in later phases; selecting them still reports
+    /// the intended backend, but desktop offers are rejected until then.
+    pub fn implemented(self) -> bool {
+        matches!(self, Self::Wayland)
+    }
+}
+
+/// The operator's backend preference.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BackendChoice {
+    #[default]
+    Auto,
+    Portal,
+    Wlroots,
+    X11,
+}
+
+impl BackendChoice {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => Ok(Self::Auto),
+            "portal" | "wayland" | "pipewire" => Ok(Self::Portal),
+            "wlroots" | "wlr" | "native" => Ok(Self::Wlroots),
+            "x11" | "xorg" => Ok(Self::X11),
+            other => Err(format!(
+                "unknown desktop backend {other:?}; use auto, portal, wlroots or x11"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Portal => "portal",
+            Self::Wlroots => "wlroots",
+            Self::X11 => "x11",
+        }
+    }
+}
+
+/// The backend requested by the operator and the one that will actually run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendSelection {
+    pub requested: Backend,
+    pub effective: Backend,
+    pub fallback: bool,
+}
+
+/// Pure backend choice for a discovered session.
+pub fn select_backend(choice: BackendChoice, session: &SessionEnv) -> Backend {
+    match choice {
+        BackendChoice::Portal => Backend::Wayland,
+        BackendChoice::Wlroots => Backend::Wlroots,
+        BackendChoice::X11 => Backend::X11,
+        BackendChoice::Auto => match session.session_type {
+            SessionType::X11 => Backend::X11,
+            SessionType::Wayland => match session.desktop {
+                DesktopKind::Gnome | DesktopKind::Kde => Backend::Wayland,
+                DesktopKind::Other => Backend::Wlroots,
+            },
+        },
+    }
+}
+
+/// The native wlroots backend ships in a later phase. Auto selection keeps
+/// wlroots desktops working through the portal (which already worked before
+/// this phase); an explicit `wlroots` request must fail instead of silently
+/// changing backend.
+pub fn effective_selection(choice: BackendChoice, session: &SessionEnv) -> BackendSelection {
+    let requested = select_backend(choice, session);
+    if choice == BackendChoice::Auto && requested == Backend::Wlroots {
+        BackendSelection {
+            requested,
+            effective: Backend::Wayland,
+            fallback: true,
+        }
+    } else {
+        BackendSelection {
+            requested,
+            effective: requested,
+            fallback: false,
+        }
+    }
+}
+
+/// Resolve the selected backend from the current graphical session.
+pub async fn detect_backend(choice: BackendChoice) -> Result<Backend, String> {
+    Ok(detect_backend_selection(choice).await?.0.effective)
+}
+
+pub async fn detect_backend_selection(
+    choice: BackendChoice,
+) -> Result<(BackendSelection, SessionEnv), String> {
+    #[cfg(not(all(target_os = "linux", feature = "desktop")))]
+    {
+        let _ = choice;
+        return Err(
+            "this build has no desktop capture support; rebuild with the `desktop` feature"
+                .to_owned(),
+        );
+    }
+    #[cfg(all(target_os = "linux", feature = "desktop"))]
+    match session_env::detect().await {
+        session_env::SessionState::Available(env) => Ok((effective_selection(choice, &env), env)),
+        session_env::SessionState::NoSession | session_env::SessionState::Unknown => {
+            Err(session_env::WAITING.to_owned())
+        }
+        session_env::SessionState::Unavailable(error) => {
+            Err(format!("{} ({error})", session_env::WAITING))
+        }
+    }
 }
 
 /// What the portal is allowed to capture.
@@ -303,8 +432,12 @@ pub async fn start_with(
     match backend {
         #[cfg(all(target_os = "linux", feature = "desktop"))]
         Backend::Wayland => wayland::start(options).await,
+        #[cfg(all(target_os = "linux", feature = "desktop"))]
+        Backend::Wlroots => Err("native wlroots capture is not implemented until Phase 8; \
+             use --desktop-backend portal or auto"
+            .to_owned()),
         #[cfg(all(target_os = "linux", not(feature = "desktop")))]
-        Backend::Wayland => {
+        Backend::Wayland | Backend::Wlroots => {
             let _ = options;
             Err(
                 "this build has no desktop capture support; rebuild with the `desktop` feature"
@@ -318,24 +451,105 @@ pub async fn start_with(
     }
 }
 
-pub fn detect_backend() -> Result<Backend, String> {
-    #[cfg(all(target_os = "linux", not(feature = "desktop")))]
-    {
-        Err(
-            "this build has no desktop capture support; rebuild with the `desktop` feature"
-                .to_owned(),
-        )
-    }
-    #[cfg(any(not(target_os = "linux"), feature = "desktop"))]
-    {
-        if std::env::var_os("WAYLAND_DISPLAY").is_some()
-            || std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("wayland")
-        {
-            return Ok(Backend::Wayland);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env(session_type: SessionType, desktop: DesktopKind) -> SessionEnv {
+        SessionEnv {
+            session_id: "2".to_owned(),
+            session_type,
+            wayland_display: (session_type == SessionType::Wayland).then(|| "wayland-0".to_owned()),
+            x11_display: (session_type == SessionType::X11).then(|| ":0".to_owned()),
+            runtime_dir: "/run/user/1000".into(),
+            bus_address: "unix:path=/run/user/1000/bus".to_owned(),
+            desktop,
+            desktop_raw: desktop.label().to_owned(),
+            leader_pid: 1234,
+            seat: "seat0".to_owned(),
+            source: session_env::SessionEnvSource::Logind,
         }
-        Err(
-            "no Wayland session detected; the X11 desktop backend is not implemented yet"
-                .to_owned(),
-        )
+    }
+
+    #[test]
+    fn auto_backend_follows_the_session_type() {
+        assert_eq!(
+            select_backend(
+                BackendChoice::Auto,
+                &env(SessionType::X11, DesktopKind::Other)
+            ),
+            Backend::X11
+        );
+        assert_eq!(
+            select_backend(
+                BackendChoice::Auto,
+                &env(SessionType::Wayland, DesktopKind::Gnome)
+            ),
+            Backend::Wayland
+        );
+        assert_eq!(
+            select_backend(
+                BackendChoice::Auto,
+                &env(SessionType::Wayland, DesktopKind::Kde)
+            ),
+            Backend::Wayland
+        );
+        assert_eq!(
+            select_backend(
+                BackendChoice::Auto,
+                &env(SessionType::Wayland, DesktopKind::Other)
+            ),
+            Backend::Wlroots
+        );
+    }
+
+    #[test]
+    fn explicit_backends_ignore_the_session_type() {
+        for (choice, expected) in [
+            (BackendChoice::Portal, Backend::Wayland),
+            (BackendChoice::Wlroots, Backend::Wlroots),
+            (BackendChoice::X11, Backend::X11),
+        ] {
+            for desktop in [DesktopKind::Gnome, DesktopKind::Kde, DesktopKind::Other] {
+                for session_type in [SessionType::Wayland, SessionType::X11] {
+                    let selection = effective_selection(choice, &env(session_type, desktop));
+                    assert_eq!(selection.effective, expected);
+                    assert_eq!(selection.requested, expected);
+                    assert!(!selection.fallback);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn auto_wlroots_falls_back_until_the_native_backend_exists() {
+        let selection = effective_selection(
+            BackendChoice::Auto,
+            &env(SessionType::Wayland, DesktopKind::Other),
+        );
+        assert_eq!(selection.requested, Backend::Wlroots);
+        assert_eq!(selection.effective, Backend::Wayland);
+        assert!(selection.fallback);
+        // Portal desktops never report a fallback.
+        let selection = effective_selection(
+            BackendChoice::Auto,
+            &env(SessionType::Wayland, DesktopKind::Kde),
+        );
+        assert!(!selection.fallback);
+    }
+
+    #[test]
+    fn backend_choice_parsing_accepts_aliases() {
+        for value in ["", " auto ", "AUTO"] {
+            assert_eq!(BackendChoice::parse(value), Ok(BackendChoice::Auto));
+        }
+        assert_eq!(BackendChoice::parse("wayland"), Ok(BackendChoice::Portal));
+        assert_eq!(BackendChoice::parse("wlr"), Ok(BackendChoice::Wlroots));
+        assert_eq!(BackendChoice::parse("xorg"), Ok(BackendChoice::X11));
+        assert!(BackendChoice::parse("mir").is_err());
+        assert_eq!(BackendChoice::Auto.as_str(), "auto");
+        assert_eq!(BackendChoice::Portal.as_str(), "portal");
+        assert_eq!(BackendChoice::Wlroots.as_str(), "wlroots");
+        assert_eq!(BackendChoice::X11.as_str(), "x11");
     }
 }
