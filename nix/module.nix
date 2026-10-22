@@ -28,7 +28,7 @@ let
     if cfg.configFile != null then
       toString cfg.configFile
     else if settings != { } then
-      "/var/lib/openuur/config.toml"
+      "${user.home}/.local/state/openuur/config.toml"
     else
       null;
 
@@ -70,6 +70,7 @@ let
   baseEnvironment = {
     HOME = user.home;
     XDG_CONFIG_HOME = "${user.home}/.config";
+    XDG_STATE_HOME = "${user.home}/.local/state";
     XDG_RUNTIME_DIR = runtimeDir;
     DBUS_SESSION_BUS_ADDRESS = "unix:path=${runtimeDir}/bus";
     XDG_SESSION_TYPE = "wayland";
@@ -137,7 +138,7 @@ in
       example = "alice";
       description = ''
         Account that owns the graphical Wayland session. The service runs as
-        this account and reads its `~/.config/openuur/config.toml` unless
+        this account and reads its `~/.local/state/openuur/config.toml` unless
         `configFile` or `settings` is set.
       '';
     };
@@ -361,8 +362,6 @@ in
           WorkingDirectory = user.home;
           PrivateTmp = true;
           LimitNOFILE = 65536;
-          StateDirectory = "openuur";
-          StateDirectoryMode = "0700";
         }
         // lib.optionalAttrs (cfg.group != null) {
           Group = cfg.group;
@@ -378,8 +377,8 @@ in
 
     systemd.tmpfiles.rules =
       lib.optionals (settings != { }) [
-        "d /var/lib/openuur 0700 ${cfg.user} ${if cfg.group != null then cfg.group else "-"} - -"
-        "C /var/lib/openuur/config.toml 0600 ${cfg.user} ${if cfg.group != null then cfg.group else "-"} - ${generatedConfig}"
+        "d '${user.home}/.local/state/openuur' 0700 ${cfg.user} ${if cfg.group != null then cfg.group else "-"} - -"
+        "C '${user.home}/.local/state/openuur/config.toml' 0600 ${cfg.user} ${if cfg.group != null then cfg.group else "-"} - ${generatedConfig}"
       ]
       ++ lib.optional (cfg.fileSavePath != null) ''
         d '${toString cfg.fileSavePath}' 0755 ${cfg.user} ${if cfg.group != null then cfg.group else "-"} - -

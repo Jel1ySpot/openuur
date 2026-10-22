@@ -8,14 +8,16 @@ Type=simple
 ExecStart=/usr/local/bin/openuurd run
 Restart=on-failure
 RestartSec=3
-# openuurd reads ~/.config/openuur/config.toml. Run it as the account owner
+# openuurd reads ~/.local/state/openuur/config.toml. Run it as the account owner
 # (for a user service, or set User= below for a system service).
 Environment=RUST_LOG=openuur=info,openuurd=info
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.config/openuur
+ReadWritePaths=%h/.local/state/openuur
+ReadWritePaths=-%h/Downloads
+ReadWritePaths=-%h/.local/share/openuur
 
 [Install]
 WantedBy=multi-user.target

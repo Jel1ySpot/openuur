@@ -9,6 +9,25 @@ fn default_api_base() -> String {
     DEFAULT_API_BASE.to_owned()
 }
 
+/// `XDG_DOWNLOAD_DIR` from `user-dirs.dirs`, resolved against `$HOME`.
+fn xdg_download_dir(home: &Path) -> Option<PathBuf> {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| home.join(".config"));
+    let text = fs::read_to_string(config.join("user-dirs.dirs")).ok()?;
+    let home = home.to_string_lossy();
+    let value = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("XDG_DOWNLOAD_DIR="))?
+        .trim()
+        .trim_matches('"')
+        .replace("${HOME}", &home)
+        .replace("$HOME", &home);
+    let path = PathBuf::from(value);
+    path.is_absolute().then_some(path)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_api_base")]
@@ -68,10 +87,18 @@ impl Config {
         if let Ok(path) = std::env::var("OPENUUR_CONFIG") {
             return Ok(PathBuf::from(path));
         }
-        let base = dirs::config_dir().ok_or_else(|| {
-            Error::Config("cannot determine the user config directory".to_owned())
-        })?;
-        Ok(base.join("openuur").join("config.toml"))
+        let state = dirs::state_dir().map(|base| base.join("openuur").join("config.toml"));
+        let legacy = dirs::config_dir().map(|base| base.join("openuur").join("config.toml"));
+        match (state, legacy) {
+            // Keep using an existing config from the old location until the
+            // user moves it, so upgrading does not lose the token or device id.
+            (Some(state), Some(legacy)) if !state.exists() && legacy.exists() => Ok(legacy),
+            (Some(state), _) => Ok(state),
+            (None, Some(legacy)) => Ok(legacy),
+            (None, None) => Err(Error::Config(
+                "cannot determine the user state directory".to_owned(),
+            )),
+        }
     }
 
     pub fn load() -> Result<Self> {
@@ -168,7 +195,8 @@ impl Config {
     }
 
     /// Directory the file-transfer window starts in and uploads default to.
-    /// Falls back to `$XDG_DOWNLOAD_DIR`, `~/Downloads`, then the home directory.
+    /// Falls back to `$XDG_DOWNLOAD_DIR`, `~/Downloads`, then
+    /// `~/.local/share/openuur/downloads`.
     pub fn file_save_path(&self) -> PathBuf {
         let expand = |value: &str| {
             let value = value.trim();
@@ -194,12 +222,16 @@ impl Config {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/"));
+        if let Some(downloads) = xdg_download_dir(&home) {
+            if downloads.is_dir() {
+                return downloads;
+            }
+        }
         let downloads = home.join("Downloads");
         if downloads.is_dir() {
-            downloads
-        } else {
-            home
+            return downloads;
         }
+        home.join(".local/share/openuur/downloads")
     }
 
     /// Display source selected for the portal: `monitor` (default), `window`

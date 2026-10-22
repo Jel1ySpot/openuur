@@ -215,9 +215,9 @@ openuur.override { ffmpeg = pkgs.ffmpeg-full; }
 }
 ```
 
-- `configFile` 与 `settings` 互斥；`settings` 会复制到可写状态文件（系统服务 `/var/lib/openuur/config.toml`，Home Manager `~/.local/state/openuur/config.toml`），仅在文件不存在时复制；修改 Nix 配置后删除该文件即可重新应用。
-- `settings` 不要放 `token`。系统服务可用该账号执行 `openuur --config /var/lib/openuur/config.toml login --qr` 登录/注册；Home Manager 使用 `~/.local/state/openuur/config.toml`。也可以直接用 `configFile` 指向 secret 管理的可写配置；如果该文件只读，需已包含注册后的 `device_id` 和 `device_registered = true`。
-- 服务默认读取目标账号的 `~/.config/openuur/config.toml`；先以该账号执行 `openuur login --qr`。
+- `configFile` 与 `settings` 互斥；`settings` 会复制到可写状态文件 `~/.local/state/openuur/config.toml`（系统服务和 Home Manager 相同），仅在文件不存在时复制；修改 Nix 配置后删除该文件即可重新应用。
+- `settings` 不要放 `token`。可用该账号执行 `openuur --config ~/.local/state/openuur/config.toml login --qr` 登录/注册。也可以直接用 `configFile` 指向 secret 管理的可写配置；如果该文件只读，需已包含注册后的 `device_id` 和 `device_registered = true`。
+- 服务默认读取目标账号的 `~/.local/state/openuur/config.toml`；先以该账号执行 `openuur login --qr`。旧的 `~/.config/openuur/config.toml` 在状态目录没有配置时仍会继续使用。
 - 系统服务会在启动时检测 `$XDG_RUNTIME_DIR/wayland-*`，因此 `wayland-0`/`wayland-1` 都可用。
 - `services.openuur.ffmpegPackage` 可选择 `pkgs.ffmpeg-full` 以获得更多硬件编码器。
 

@@ -54,6 +54,7 @@ let
     {
       HOME = home;
       XDG_CONFIG_HOME = "${home}/.config";
+      XDG_STATE_HOME = "${home}/.local/state";
       XDG_RUNTIME_DIR = "%t";
       DBUS_SESSION_BUS_ADDRESS = "unix:path=%t/bus";
       XDG_SESSION_TYPE = "wayland";
@@ -123,7 +124,7 @@ in
     configFile = lib.mkOption {
       type = types.nullOr (types.either types.path types.str);
       default = null;
-      description = "Host config file, normally `~/.config/openuur/config.toml`.";
+      description = "Host config file, normally `~/.local/state/openuur/config.toml`.";
     };
 
     settings = lib.mkOption {

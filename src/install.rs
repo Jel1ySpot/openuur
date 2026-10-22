@@ -115,7 +115,7 @@ fn find_binary(explicit: Option<&Path>) -> Result<PathBuf, String> {
 
 fn default_config(user_home: Option<&Path>) -> Result<PathBuf, String> {
     match user_home {
-        Some(home) => Ok(home.join(".config/openuur/config.toml")),
+        Some(home) => Ok(home.join(".local/state/openuur/config.toml")),
         None => crate::config::Config::path().map_err(|error| error.to_string()),
     }
 }
@@ -368,11 +368,11 @@ mod tests {
     fn user_unit_has_graphical_dependencies_and_escaped_paths() {
         let unit = user_unit(
             Path::new("/home/u/.local/bin/openuurd"),
-            Path::new("/home/u/.config/openuur/config.toml"),
+            Path::new("/home/u/.local/state/openuur/config.toml"),
         );
         assert!(unit.contains("After=graphical-session.target"));
         assert!(unit.contains("WantedBy=default.target"));
-        assert!(unit.contains("ExecStart=/home/u/.local/bin/openuurd run --config /home/u/.config/openuur/config.toml"));
+        assert!(unit.contains("ExecStart=/home/u/.local/bin/openuurd run --config /home/u/.local/state/openuur/config.toml"));
         assert!(unit.contains("Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus"));
     }
 
@@ -380,7 +380,7 @@ mod tests {
     fn system_unit_sets_the_graphical_account_and_runtime_dir() {
         let unit = system_unit(
             Path::new("/usr/local/bin/openuurd"),
-            Path::new("/home/u/.config/openuur/config.toml"),
+            Path::new("/home/u/.local/state/openuur/config.toml"),
             "u",
             1000,
             Some("wayland-1"),
