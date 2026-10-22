@@ -17,7 +17,7 @@ use x11rb::protocol::damage::{self, ReportLevel};
 use x11rb::protocol::{randr, shm, xproto, Event};
 use x11rb::rust_connection::RustConnection;
 
-use super::super::{CapturedFrame, DesktopState};
+use super::super::{CapturedFrame, DesktopState, ScreenInfo};
 
 const INIT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -116,6 +116,7 @@ fn run(
     let mut paused = false;
     let mut active = state.active_id();
     let mut damage_seq: Option<u32> = damage;
+    let mut next_geometry = Instant::now() + Duration::from_secs(2);
 
     while !stop.load(Ordering::Acquire) {
         let mut layout_changed = false;
@@ -130,15 +131,26 @@ fn run(
                 }
                 Ok(Some(_)) => {}
                 Ok(None) => break,
-                Err(error) => return Err(format!("X11 event read failed: {error}")),
+                Err(error) => {
+                    // Never leave the last frame on screen pretending the
+                    // session is still live.
+                    state.clear_frame();
+                    return Err(format!("X11 event read failed: {error}"));
+                }
             }
         }
-        if layout_changed && randr {
-            if let Some(screens) = super::randr_monitors(&connection, root) {
-                let active = state.active_id();
-                state.publish(screens, active, (0, 0, 0));
+        if layout_changed {
+            if refresh_layout(&connection, root, &state) {
                 dirty = true;
             }
+        }
+        // RandR older than 1.5 (and servers without RandR) only expose the
+        // root size, so poll it rather than missing a resize.
+        if Instant::now() >= next_geometry {
+            if refresh_layout(&connection, root, &state) {
+                dirty = true;
+            }
+            next_geometry = Instant::now() + Duration::from_secs(2);
         }
         // `switch_screen` only changes shared state; an idle desktop produces
         // no damage, so the active id itself must trigger a fresh capture.
@@ -209,7 +221,40 @@ fn run(
         let _ = damage::destroy(&connection, damage);
     }
     segment.release(&connection);
+    state.clear_frame();
     Ok(())
+}
+
+/// Refresh the screen inventory from RandR, falling back to the root
+/// geometry when RandR 1.5 monitors are unavailable. Returns whether the
+/// inventory changed.
+fn refresh_layout(connection: &impl Connection, root: u32, state: &DesktopState) -> bool {
+    let screens = if let Some(monitors) = super::randr_monitors(connection, root) {
+        monitors
+    } else {
+        let reply = match xproto::get_geometry(connection, root)
+            .ok()
+            .map(|cookie| cookie.reply())
+        {
+            Some(Ok(reply)) => reply,
+            _ => return false,
+        };
+        vec![ScreenInfo {
+            id: 0,
+            node_id: 0,
+            x: 0,
+            y: 0,
+            width: u32::from(reply.width),
+            height: u32::from(reply.height),
+            primary: true,
+        }]
+    };
+    if screens == state.screens() {
+        return false;
+    }
+    let active = state.active_id();
+    state.publish(screens, active, (0, 0, 0));
+    true
 }
 
 /// Poll the connection socket for at most `wait`, so damage wakes the loop
@@ -274,7 +319,19 @@ impl Buffer {
                 }
             }
             if let Some(segment) = self.segment.as_ref() {
-                return segment.capture(connection, root, x, y, width, height, len);
+                match segment.capture(connection, root, x, y, width, height, len) {
+                    Ok(data) => return Ok(data),
+                    Err(error) => {
+                        tracing::warn!("X11 shared-memory image failed ({error}); using GetImage");
+                        // One failure disables the fast path for the rest of
+                        // the session so a broken server cannot log at frame
+                        // rate.
+                        self.shm = false;
+                    }
+                }
+            }
+            if let Some(old) = self.segment.take() {
+                old.release(connection);
             }
         }
 

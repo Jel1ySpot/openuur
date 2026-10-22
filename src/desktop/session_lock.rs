@@ -291,6 +291,13 @@ pub fn supported() -> bool {
     *SUPPORTED.get_or_init(|| pam_available() && display_session().is_some())
 }
 
+/// Lock state with the policy for unknown values applied: unknown counts as
+/// unlocked so hosts without logind still serve input and capture.
+/// `UU_LOCK_FAIL_CLOSED=1` makes unknown count as locked instead.
+pub fn effective_locked(locked: Option<bool>) -> bool {
+    locked.unwrap_or_else(|| std::env::var("UU_LOCK_FAIL_CLOSED").ok().as_deref() == Some("1"))
+}
+
 /// Current lock state (`None` = unknown), refreshed once per second.
 pub fn watch_locked() -> watch::Receiver<Option<bool>> {
     static STATE: OnceLock<watch::Sender<Option<bool>>> = OnceLock::new();

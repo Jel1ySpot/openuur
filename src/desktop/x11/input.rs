@@ -44,7 +44,7 @@ pub(crate) async fn start(
     stop: Arc<AtomicBool>,
     locked: watch::Receiver<Option<bool>>,
 ) -> Result<Arc<dyn InputSink>, String> {
-    let (commands, receiver) = mpsc::channel();
+    let (commands, receiver) = mpsc::sync_channel(1024);
     let (ready_tx, ready_rx) = oneshot::channel();
     std::thread::Builder::new()
         .name("openuur-x11-input".into())
@@ -68,39 +68,48 @@ enum Command {
 }
 
 struct Input {
-    commands: mpsc::Sender<Command>,
+    commands: mpsc::SyncSender<Command>,
 }
 
 impl Input {
-    fn send(&self, command: Command) {
-        // A dead thread means the desktop is gone; dropping input is safe.
-        let _ = self.commands.send(command);
+    /// Pointer motion is coalescible, so a saturated queue drops it. Key and
+    /// button transitions must not be lost; they wait briefly for the X
+    /// server to drain.
+    fn send(&self, command: Command, reliable: bool) {
+        match self.commands.try_send(command) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(command)) if reliable => {
+                std::thread::sleep(Duration::from_millis(1));
+                let _ = self.commands.try_send(command);
+            }
+            Err(_) => {}
+        }
     }
 }
 
 impl InputSink for Input {
     fn pointer_absolute(&self, x: f64, y: f64) {
-        self.send(Command::Absolute(x, y));
+        self.send(Command::Absolute(x, y), false);
     }
 
     fn pointer_relative(&self, dx: i32, dy: i32) {
-        self.send(Command::Relative(dx, dy));
+        self.send(Command::Relative(dx, dy), false);
     }
 
     fn button(&self, button: i32, pressed: bool) {
-        self.send(Command::Button(button, pressed));
+        self.send(Command::Button(button, pressed), true);
     }
 
     fn scroll(&self, dx: i32, dy: i32) {
-        self.send(Command::Scroll(dx, dy));
+        self.send(Command::Scroll(dx, dy), false);
     }
 
     fn key(&self, vk: i32, pressed: bool) {
-        self.send(Command::Key(vk, pressed));
+        self.send(Command::Key(vk, pressed), true);
     }
 
     fn text(&self, text: &str) {
-        self.send(Command::Text(text.to_owned()));
+        self.send(Command::Text(text.to_owned()), true);
     }
 }
 
@@ -177,6 +186,9 @@ fn run(
                     keyboard.key(&connection, root, vk, pressed, &mut held)
                 }
                 Command::Text(text) => {
+                    // The viewer may send CRLF; a terminal should see one
+                    // Return per line.
+                    let text = text.replace("\r\n", "\n");
                     let mut failure = Ok(());
                     for ch in text.chars() {
                         // A long paste must not keep typing after the screen
@@ -216,7 +228,12 @@ fn run(
 fn drain_mapping_events(connection: &impl Connection, keyboard: &mut Keyboard) {
     while let Ok(Some(event)) = connection.poll_for_event() {
         if let Event::MappingNotify(event) = event {
-            if event.request == xproto::Mapping::KEYBOARD {
+            // Modifier changes move Shift and invalidate the spare keycode's
+            // modifier exclusions just as a keyboard-map change does.
+            if matches!(
+                event.request,
+                xproto::Mapping::KEYBOARD | xproto::Mapping::MODIFIER
+            ) {
                 if let Err(error) = keyboard.reload(connection) {
                     tracing::debug!("X11 keyboard mapping refresh failed: {error}");
                 }
@@ -502,7 +519,10 @@ impl Keyboard {
             let Some(row) = self.keysyms.get(base..base + self.per as usize) else {
                 continue;
             };
-            for (level, candidate) in row.iter().enumerate() {
+            // Only the first group (levels 0 and 1) is reachable without a
+            // group switch; a match at a higher level would type the wrong
+            // character, so those keysyms go through the spare keycode.
+            for (level, candidate) in row.iter().take(2).enumerate() {
                 if *candidate == keysym {
                     return Some((keycode, level as u8));
                 }
@@ -533,14 +553,19 @@ impl Keyboard {
                     let owned_shift = if shifted {
                         // Another held key (or the client's own Shift) may
                         // already keep Shift down; only the first owner
-                        // presses it, and the last release lets go.
-                        if self.shift_refs == 0 {
-                            if let Some(shift) = self.shift {
-                                key_event(connection, shift, true)?;
+                        // presses it, and the last release lets go. A Shift
+                        // held outside this session is left to its holder.
+                        if self.shift_refs == 0 && shift_down(connection, root) {
+                            None
+                        } else {
+                            if self.shift_refs == 0 {
+                                if let Some(shift) = self.shift {
+                                    key_event(connection, shift, true)?;
+                                }
                             }
+                            self.shift_refs += 1;
+                            self.shift
                         }
-                        self.shift_refs += 1;
-                        self.shift
                     } else if is_shift_key {
                         self.shift_refs += 1;
                         Some(keycode)
@@ -590,34 +615,36 @@ impl Keyboard {
         Ok(())
     }
 
-    /// Type one keysym by remapping a spare keycode for the duration of the
-    /// press. The mapping is server-global, so restore it immediately.
+    /// Type one keysym. A keycode already carrying the keysym is used
+    /// directly (with Shift when needed); anything else is typed through a
+    /// spare keycode remapped for the duration of the press. The mapping is
+    /// server-global, so it is restored immediately.
     fn type_keysym(
         &mut self,
         connection: &impl Connection,
         root: u32,
         keysym: u32,
     ) -> Result<(), String> {
-        let Some(spare) = self.spare else {
-            if let Some((keycode, level)) = self.lookup(keysym) {
-                let need_shift = !is_keypad(keysym)
-                    && level % 2 == 1
-                    && self.shift_refs == 0
-                    && !shift_down(connection, root);
-                if need_shift {
-                    if let Some(shift) = self.shift {
-                        key_event(connection, shift, true)?;
-                    }
+        if let Some((keycode, level)) = self.lookup(keysym) {
+            let need_shift = !is_keypad(keysym)
+                && level % 2 == 1
+                && self.shift_refs == 0
+                && !shift_down(connection, root);
+            if need_shift {
+                if let Some(shift) = self.shift {
+                    key_event(connection, shift, true)?;
                 }
-                let result = key_event(connection, keycode, true)
-                    .and_then(|()| key_event(connection, keycode, false));
-                if need_shift {
-                    if let Some(shift) = self.shift {
-                        let _ = key_event(connection, shift, false);
-                    }
-                }
-                return result;
             }
+            let result = key_event(connection, keycode, true)
+                .and_then(|()| key_event(connection, keycode, false));
+            if need_shift {
+                if let Some(shift) = self.shift {
+                    let _ = key_event(connection, shift, false);
+                }
+            }
+            return result;
+        }
+        let Some(spare) = self.spare else {
             return Ok(());
         };
         let row = vec![keysym; self.per as usize];

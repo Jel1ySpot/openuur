@@ -300,10 +300,27 @@ impl DesktopState {
         active: u32,
         input_target: (u32, u32, u32),
     ) {
-        let active = if screens.iter().any(|screen| screen.id == active) {
-            active
-        } else {
-            screens.first().map(|screen| screen.id).unwrap_or(0)
+        // Keep a screen switch that raced with this inventory update: the
+        // stored id wins while it still exists in the new list, and the
+        // compare-exchange avoids overwriting a switch made during this call.
+        let mut current = self.active.load(Ordering::Acquire);
+        let active = loop {
+            let desired = if screens.iter().any(|screen| screen.id == current) {
+                current
+            } else if screens.iter().any(|screen| screen.id == active) {
+                active
+            } else {
+                screens.first().map(|screen| screen.id).unwrap_or(0)
+            };
+            match self.active.compare_exchange(
+                current,
+                desired,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break desired,
+                Err(actual) => current = actual,
+            }
         };
         let size = screens
             .iter()
@@ -316,7 +333,6 @@ impl DesktopState {
         if let Ok(mut target) = self.input_target.write() {
             *target = input_target;
         }
-        self.active.store(active, Ordering::Release);
         self.width.store(size.0, Ordering::Release);
         self.height.store(size.1, Ordering::Release);
         self.frames.send_replace(None);

@@ -167,6 +167,26 @@ fn probe(display: Option<&str>) -> Result<Probe, String> {
     if setup.image_byte_order != x11rb::protocol::xproto::ImageOrder::LSB_FIRST {
         return Err("X11 MSB-first pixel order is not supported".to_owned());
     }
+    let Some(visual) = screen
+        .allowed_depths
+        .iter()
+        .flat_map(|depth| depth.visuals.iter())
+        .find(|visual| visual.visual_id == screen.root_visual)
+    else {
+        return Err("the X11 root visual is missing".to_owned());
+    };
+    if visual.class != x11rb::protocol::xproto::VisualClass::TRUE_COLOR {
+        return Err("only TrueColor X11 visuals are supported".to_owned());
+    }
+    if visual.red_mask != 0x00ff_0000
+        || visual.green_mask != 0x0000_ff00
+        || visual.blue_mask != 0x0000_00ff
+    {
+        return Err(format!(
+            "unsupported X11 channel masks {:06x}/{:06x}/{:06x}; capture assumes RGB",
+            visual.red_mask, visual.green_mask, visual.blue_mask
+        ));
+    }
 
     let randr = connection
         .extension_information("RANDR")
@@ -306,10 +326,7 @@ pub(crate) fn normalized_to_pixel(value: f64, size: u32) -> f64 {
 /// without logind still serves input; `UU_LOCK_FAIL_CLOSED=1` flips that.
 #[cfg(feature = "desktop")]
 pub(crate) fn lock_active(locked: &watch::Receiver<Option<bool>>) -> bool {
-    match *locked.borrow() {
-        Some(locked) => locked,
-        None => std::env::var("UU_LOCK_FAIL_CLOSED").ok().as_deref() == Some("1"),
-    }
+    super::session_lock::effective_locked(*locked.borrow())
 }
 
 #[cfg(all(test, feature = "desktop"))]
@@ -317,7 +334,6 @@ mod tests {
     use super::*;
     use crate::desktop::CapturedFrame;
     use std::process::{Child, Command};
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -357,33 +373,52 @@ mod tests {
         }
     }
 
-    static NEXT_DISPLAY: AtomicU32 = AtomicU32::new(0);
-
-    /// Start Xvfb on a display number unique to this test binary.
+    /// Start Xvfb and learn its display from `-displayfd`, so a server that
+    /// already exists on a guessed number can never be used by accident.
     fn start_xvfb(width: u32, height: u32) -> (Xvfb, String) {
-        let display = format!(
-            ":{}",
-            90 + (std::process::id() % 500) + NEXT_DISPLAY.fetch_add(1, Ordering::Relaxed) * 2
-        );
+        use std::io::BufRead;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        use std::os::unix::process::CommandExt;
+
         let geometry = format!("{width}x{height}x24");
-        let child = Command::new("Xvfb")
-            .args([&display, "-screen", "0", &geometry, "-nolisten", "tcp"])
+        let (reader, writer) = UnixStream::pair().expect("displayfd pipe");
+        let writer_fd = writer.as_raw_fd();
+        let mut command = Command::new("Xvfb");
+        command
+            .args([
+                "-displayfd",
+                "3",
+                "-screen",
+                "0",
+                &geometry,
+                "-nolisten",
+                "tcp",
+            ])
             .args(["+extension", "RANDR", "+extension", "DAMAGE"])
             .args(["+extension", "MIT-SHM", "+extension", "XFIXES"])
-            .args(["+extension", "XTEST"])
-            .spawn()
-            .expect("Xvfb");
-        let server = Xvfb(child);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match x11rb::connect(Some(&display)) {
-                Ok(_) => return (server, display),
-                Err(_) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(100));
+            .args(["+extension", "XTEST"]);
+        // SAFETY: pre_exec only duplicates an already-open descriptor; it does
+        // not allocate, lock, or otherwise run non-async-signal-safe code.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(writer_fd, 3) < 0 {
+                    return Err(std::io::Error::last_os_error());
                 }
-                Err(error) => panic!("Xvfb did not start: {error}"),
-            }
+                Ok(())
+            });
         }
+        let child = command.spawn().expect("Xvfb");
+        drop(writer);
+        let mut reader = std::io::BufReader::new(reader);
+        let _ = reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(10)));
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("Xvfb display number");
+        let number = line.trim();
+        assert!(!number.is_empty(), "Xvfb did not report a display");
+        (Xvfb(child), format!(":{number}"))
     }
 
     fn poll_until<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> T {
