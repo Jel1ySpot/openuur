@@ -33,6 +33,15 @@ const FOS_SKIP: u64 = 3;
 const FOS_RESUME: u64 = 4;
 type PendingKey = (u32, u64, u64, u64);
 
+const FILE_CHANNEL: &str = "FILE_DATA_CHANNEL";
+
+tokio::task_local! {
+    /// Channel the inbound file RPC being handled arrived on. Official viewers
+    /// do not always read replies from FILE_DATA_CHANNEL; the host mirrors the
+    /// reply onto the request's own channel so either listener sees it.
+    static REPLY_CHANNEL: String;
+}
+
 const DOWNLOAD_BLOCK: usize = 32 * 1024;
 /// Concurrent block requests sent to the viewer. Together with the bounded
 /// writer queue this caps memory and keeps a slow channel from growing an
@@ -62,6 +71,11 @@ struct Upload {
 
 pub struct FileTransfer {
     out: mpsc::Sender<Vec<u8>>,
+    /// Replies are also queued here as `(request channel, framed Message)`.
+    /// The host forwards them to that channel so viewers that only read RPC
+    /// responses from the channel they sent on still see the answer.
+    mirror: Option<mpsc::Sender<(String, Vec<u8>)>>,
+    sequence: Arc<AtomicU64>,
     save_path: PathBuf,
     next_request: AtomicU64,
     pending: Mutex<HashMap<PendingKey, oneshot::Sender<Vec<u8>>>>,
@@ -79,11 +93,11 @@ fn encode_task(id: TaskId) -> Vec<u8> {
 }
 
 fn parse_task(fields: &[Field]) -> TaskId {
-    wire::blob(fields, 1)
+    get_bytes(fields, 1)
         .and_then(wire::decode)
         .map(|fields| TaskId {
-            task: wire::uint(&fields, 1).unwrap_or(0),
-            index: wire::uint(&fields, 2).unwrap_or(0),
+            task: get_uint(&fields, 1),
+            index: get_uint(&fields, 2),
         })
         .unwrap_or_default()
 }
@@ -109,11 +123,28 @@ fn parse_file(data: &[u8]) -> Option<FileInfo> {
 }
 
 fn get_uint(fields: &[Field], number: u32) -> u64 {
-    wire::uint(fields, number).unwrap_or(0)
+    fields
+        .iter()
+        .rev()
+        .find_map(|field| match (field.number, &field.value) {
+            (n, wire::Value::Varint(value)) if n == number => Some(*value),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
+fn get_bytes(fields: &[Field], number: u32) -> Option<&[u8]> {
+    fields
+        .iter()
+        .rev()
+        .find_map(|field| match (field.number, &field.value) {
+            (n, wire::Value::Bytes(value)) if n == number => Some(value.as_slice()),
+            _ => None,
+        })
 }
 
 fn get_text(fields: &[Field], number: u32) -> String {
-    wire::blob(fields, number)
+    get_bytes(fields, number)
         .and_then(|value| std::str::from_utf8(value).ok())
         .unwrap_or_default()
         .to_owned()
@@ -128,6 +159,16 @@ fn get_all(fields: &[Field], number: u32) -> Vec<Vec<u8>> {
             _ => None,
         })
         .collect()
+}
+
+/// Reads varint fields of one FileTransferFtpResponse case. `ftp` is the
+/// response wrapper (`<case, body>`), so the case body must be extracted first.
+fn case_uints<const N: usize>(ftp: &[u8], case: u32, numbers: [u32; N]) -> [u64; N] {
+    let fields = wire::decode(ftp)
+        .and_then(|fields| get_bytes(&fields, case).map(<[u8]>::to_vec))
+        .and_then(|body| wire::decode(&body))
+        .unwrap_or_default();
+    numbers.map(|number| get_uint(&fields, number))
 }
 
 fn parse_files(inline: Vec<Vec<u8>>, list_data: Option<&[u8]>) -> Vec<FileInfo> {
@@ -223,6 +264,16 @@ fn is_this_pc(path: &str) -> bool {
             .all(|character| character.is_ascii_alphabetic())
 }
 
+/// The phone's "Default" destination on this PC. It is a virtual folder, not
+/// a real path, and resolves to the host's configured receive directory.
+fn is_default_target(path: &str) -> bool {
+    let value = path.trim().replace('\\', "/");
+    value
+        .trim_end_matches('/')
+        .eq_ignore_ascii_case(":/default")
+        || value.trim_end_matches('/').eq_ignore_ascii_case("default")
+}
+
 fn modified(path: &Path) -> u64 {
     std::fs::metadata(path)
         .and_then(|metadata| metadata.modified())
@@ -308,7 +359,11 @@ fn list_directory(path: &str, save_path: &Path) -> Result<Vec<Vec<u8>>, u64> {
     if is_this_pc(path) {
         return Ok(this_pc(save_path));
     }
-    let directory = normalize(path);
+    let directory = if is_default_target(path) {
+        save_path.to_path_buf()
+    } else {
+        normalize(path)
+    };
     let entries = std::fs::read_dir(&directory).map_err(|error| io_error(&error))?;
     let mut list = Vec::new();
     for item in entries.flatten() {
@@ -410,10 +465,17 @@ fn collect_download(path: &Path) -> std::io::Result<(String, Vec<(FileInfo, Path
 }
 
 impl FileTransfer {
-    pub fn new(out: mpsc::Sender<Vec<u8>>, save_path: PathBuf) -> Arc<Self> {
+    pub fn new(
+        out: mpsc::Sender<Vec<u8>>,
+        mirror: Option<mpsc::Sender<(String, Vec<u8>)>>,
+        save_path: PathBuf,
+        sequence: Arc<AtomicU64>,
+    ) -> Arc<Self> {
         let _ = std::fs::create_dir_all(&save_path);
         Arc::new(Self {
             out,
+            mirror,
+            sequence,
             save_path,
             next_request: AtomicU64::new(1 << 32),
             pending: Mutex::new(HashMap::new()),
@@ -436,23 +498,52 @@ impl FileTransfer {
     }
 
     async fn send(&self, which: u32, body: &[u8]) -> bool {
+        // File RPCs share the peer's control sequence; viewers track it even
+        // though responses are correlated by the FTP body instead of the header.
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        self.send_with_seq(sequence, which, body).await
+    }
+
+    async fn send_with_seq(&self, sequence: u64, which: u32, body: &[u8]) -> bool {
         if self.stopped.load(Ordering::Acquire) {
             return false;
         }
-        let message = wire::message(0, which, body);
+        let message = wire::message(sequence, which, body);
+        let bytes = message.len();
+        // Official clients only dispatch RPC responses from the channel they
+        // sent the request on. Reply there and skip FILE for those requests;
+        // CONTROL requests keep the reference viewer's FILE reply.
+        let reply_label = REPLY_CHANNEL.try_with(Clone::clone).ok();
+        let text_reply = which == 22 && reply_label.as_deref() == Some("TEXT_DATA_CHANNEL");
+        if which == 22 {
+            if let Some(mirror) = &self.mirror {
+                if let Some(label) = reply_label.filter(|label| label != FILE_CHANNEL) {
+                    if mirror.try_send((label, message.clone())).is_err() {
+                        tracing::debug!("file transfer mirror queue full: which={which}");
+                    }
+                }
+            }
+        }
+        if text_reply {
+            return true;
+        }
         // Await capacity: the caller is the FILE channel's message task, so a
         // slow channel applies backpressure instead of growing an unbounded
         // queue. A closed channel stops the transfer session.
         match self.out.send(message).await {
-            Ok(()) => true,
+            Ok(()) => {
+                tracing::debug!("file transfer queued: which={which} seq={sequence} bytes={bytes}");
+                true
+            }
             Err(_) => {
+                tracing::warn!("file transfer outbound closed: which={which}");
                 self.shutdown();
                 false
             }
         }
     }
 
-    async fn respond(&self, request_id: u64, case: u32, body: &[u8]) {
+    async fn respond(&self, request_sequence: u64, request_id: u64, case: u32, body: &[u8]) {
         let mut header = Vec::new();
         wire::int(1, request_id, &mut header);
         let mut ftp = Vec::new();
@@ -460,6 +551,17 @@ impl FileTransfer {
         let mut rpc = Vec::new();
         wire::bytes(1, &header, &mut rpc);
         wire::bytes(4, &ftp, &mut rpc);
+        if body.len() <= 128 {
+            tracing::debug!(
+                "file transfer respond: req_seq={request_sequence} request={request_id} case={case} body={:02x?}",
+                body
+            );
+        } else {
+            tracing::debug!(
+                "file transfer respond: req_seq={request_sequence} request={request_id} case={case} bytes={}",
+                body.len()
+            );
+        }
         self.send(22, &rpc).await;
     }
 
@@ -473,6 +575,7 @@ impl FileTransfer {
             return None;
         }
         let id = self.next_request.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!("file transfer host request: case={case} id={id} key={key:?}");
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(key, tx);
         let mut header = Vec::new();
@@ -484,18 +587,38 @@ impl FileTransfer {
         wire::bytes(8, &ftp, &mut rpc);
         self.send(21, &rpc).await;
         match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
-            Ok(Ok(value)) => Some(value),
+            Ok(Ok(value)) => {
+                tracing::debug!("file transfer host request answered: case={case} id={id}");
+                Some(value)
+            }
             _ => {
+                tracing::debug!("file transfer host request unanswered: case={case} id={id}");
                 self.pending.lock().unwrap().remove(&key);
                 None
             }
         }
     }
 
-    pub async fn handle(self: &Arc<Self>, data: &[u8]) -> bool {
+    pub async fn handle(self: &Arc<Self>, data: &[u8], channel: &str) -> bool {
+        REPLY_CHANNEL
+            .scope(channel.to_owned(), self.handle_inner(data, channel))
+            .await
+    }
+
+    async fn handle_inner(self: &Arc<Self>, data: &[u8], channel: &str) -> bool {
         let Some(message) = wire::decode(data) else {
+            tracing::debug!(
+                "{channel} file transfer: undecodable message {} bytes",
+                data.len()
+            );
             return false;
         };
+        let message_seq = wire::uint(&message, 1).unwrap_or(0);
+        tracing::debug!(
+            "{channel} file transfer message: seq={message_seq} fields={:?} bytes={}",
+            message.iter().map(|field| field.number).collect::<Vec<_>>(),
+            data.len()
+        );
         let mut handled = false;
         for field in message {
             match (field.number, &field.value) {
@@ -503,7 +626,7 @@ impl FileTransfer {
                     let Some(rpc) = wire::decode(rpc) else {
                         continue;
                     };
-                    let Some(ftp) = wire::blob(&rpc, 8) else {
+                    let Some(ftp) = get_bytes(&rpc, 8) else {
                         continue;
                     };
                     let request_id = wire::blob(&rpc, 1)
@@ -511,27 +634,37 @@ impl FileTransfer {
                         .and_then(|header| wire::uint(&header, 1))
                         .unwrap_or(0);
                     handled = true;
-                    if let Some(ftp) = wire::decode(ftp) {
-                        self.on_request(request_id, &ftp).await;
+                    match wire::decode(ftp) {
+                        Some(ftp) => {
+                            self.on_request(request_id, message_seq, &ftp, channel)
+                                .await
+                        }
+                        None => tracing::warn!(
+                            "file transfer request {request_id}: undecodable FTP body ({} bytes)",
+                            ftp.len()
+                        ),
                     }
                 }
                 (22, wire::Value::Bytes(rpc)) => {
                     let Some(rpc) = wire::decode(rpc) else {
                         continue;
                     };
-                    let Some(ftp) = wire::blob(&rpc, 4) else {
+                    let Some(ftp) = get_bytes(&rpc, 4) else {
                         continue;
                     };
                     handled = true;
                     if let Some((case, id, block)) = response_key(ftp) {
-                        if let Some(sender) = self
-                            .pending
-                            .lock()
-                            .unwrap()
-                            .remove(&(case, id.task, id.index, block))
-                        {
-                            let _ = sender.send(ftp.to_vec());
+                        let key = (case, id.task, id.index, block);
+                        match self.pending.lock().unwrap().remove(&key) {
+                            Some(sender) => {
+                                let _ = sender.send(ftp.to_vec());
+                            }
+                            None => tracing::debug!(
+                                "file transfer response without pending request: case={case} key={key:?}"
+                            ),
                         }
+                    } else {
+                        tracing::debug!("file transfer response undecodable: {} bytes", ftp.len());
                     }
                 }
                 _ => {}
@@ -540,7 +673,13 @@ impl FileTransfer {
         handled
     }
 
-    async fn on_request(self: &Arc<Self>, request_id: u64, ftp: &[Field]) {
+    async fn on_request(
+        self: &Arc<Self>,
+        request_id: u64,
+        sequence: u64,
+        ftp: &[Field],
+        channel: &str,
+    ) {
         let Some(case) = ftp
             .iter()
             .find(|field| matches!(field.value, wire::Value::Bytes(_)))
@@ -551,37 +690,58 @@ impl FileTransfer {
             return;
         };
         let Some(body) = wire::decode(body) else {
+            tracing::warn!("file transfer request {request_id}: undecodable body");
             return;
         };
+        tracing::debug!(
+            "{channel} file transfer request: id={request_id} case={} fields={:?}",
+            case.number,
+            body.iter().map(|field| field.number).collect::<Vec<_>>()
+        );
         match case.number {
-            1 => self.receive(request_id, &body).await,
-            2 => self.send_request(request_id, &body).await,
-            3 => self.file_ask(request_id, &body).await,
-            4 => self.file_block(request_id, &body).await,
-            5..=8 => self.file_operation(request_id, case.number, &body).await,
-            9 => self.complete(request_id, &body).await,
-            10 => self.read_dir(request_id, &body).await,
-            11 => self.file_exist(request_id, &body).await,
+            1 => self.receive(sequence, request_id, &body).await,
+            2 => self.send_request(sequence, request_id, &body).await,
+            3 => self.file_ask(sequence, request_id, &body).await,
+            4 => self.file_block(sequence, request_id, &body).await,
+            5..=8 => {
+                self.file_operation(sequence, request_id, case.number, &body)
+                    .await
+            }
+            9 => self.complete(sequence, request_id, &body).await,
+            10 => self.read_dir(sequence, request_id, &body).await,
+            11 => self.file_exist(sequence, request_id, &body).await,
             12 => {
-                self.respond(request_id, 5, &{
+                self.respond(sequence, request_id, 5, &{
                     let mut out = Vec::new();
                     wire::int(1, FT_SUCCEEDED, &mut out);
                     out
                 })
                 .await
             }
-            _ => {}
+            _ => tracing::info!(
+                "file transfer request case {} not implemented: fields={:?}",
+                case.number,
+                body.iter().map(|field| field.number).collect::<Vec<_>>()
+            ),
         }
     }
 
-    async fn read_dir(&self, request_id: u64, fields: &[Field]) {
+    async fn read_dir(&self, sequence: u64, request_id: u64, fields: &[Field]) {
         let id = parse_task(fields);
         let path = get_text(fields, 2);
+        tracing::info!(
+            "file transfer read_dir: path={path:?} resolved={:?}",
+            normalize(&path)
+        );
         let mut body = Vec::new();
         wire::bytes(1, &encode_task(id), &mut body);
         wire::bytes(2, path.as_bytes(), &mut body);
         match list_directory(&path, &self.save_path) {
             Ok(entries) => {
+                tracing::debug!(
+                    "file transfer read_dir ok: path={path:?} entries={}",
+                    entries.len()
+                );
                 let mut listing = Vec::new();
                 for entry in &entries {
                     wire::bytes(1, entry, &mut listing);
@@ -597,15 +757,18 @@ impl FileTransfer {
                 wire::int(4, FT_SUCCEEDED, &mut body);
                 wire::bytes(5, &compressed, &mut body);
             }
-            Err(error) => wire::int(4, error, &mut body),
+            Err(error) => {
+                tracing::info!("file transfer read_dir failed: path={path:?} error={error}");
+                wire::int(4, error, &mut body);
+            }
         }
-        self.respond(request_id, 7, &body).await;
+        self.respond(sequence, request_id, 7, &body).await;
     }
 
-    async fn receive(&self, request_id: u64, fields: &[Field]) {
+    async fn receive(&self, sequence: u64, request_id: u64, fields: &[Field]) {
         let id = parse_task(fields);
         let raw = get_text(fields, 2);
-        let target = if raw.trim().is_empty() || is_this_pc(&raw) {
+        let target = if raw.trim().is_empty() || is_this_pc(&raw) || is_default_target(&raw) {
             self.save_path.clone()
         } else {
             normalize(&raw)
@@ -613,9 +776,19 @@ impl FileTransfer {
         let folder = get_text(fields, 5);
         let strategy = get_uint(fields, 4);
         let files = parse_files(get_all(fields, 3), wire::blob(fields, 6));
+        tracing::info!(
+            "file transfer upload: task={} files={} bytes={} target={target:?} folder={folder:?} strategy={strategy}",
+            id.task,
+            files.len(),
+            files.iter().map(|file| file.size).sum::<u64>()
+        );
         let error = if target.is_dir() {
             FT_SUCCEEDED
         } else {
+            tracing::info!(
+                "file transfer upload rejected: task={} target={target:?} not a directory",
+                id.task
+            );
             FT_NOT_FOUND
         };
         let mut body = Vec::new();
@@ -646,7 +819,7 @@ impl FileTransfer {
                 },
             );
         }
-        self.respond(request_id, 1, &body).await;
+        self.respond(sequence, request_id, 1, &body).await;
     }
 
     fn upload_path(upload: &Upload, index: u64) -> Option<PathBuf> {
@@ -668,7 +841,7 @@ impl FileTransfer {
         Some(path)
     }
 
-    async fn file_ask(&self, request_id: u64, fields: &[Field]) {
+    async fn file_ask(&self, sequence: u64, request_id: u64, fields: &[Field]) {
         let id = parse_task(fields);
         let size = get_uint(fields, 3);
         let (skip, error, resume) = {
@@ -726,15 +899,18 @@ impl FileTransfer {
         };
         let mut body = Vec::new();
         wire::bytes(1, &encode_task(id), &mut body);
-        if skip {
-            wire::int(2, 1, &mut body);
-        }
+        tracing::info!(
+            "file transfer file_ask: task={} index={} size={size} skip={skip} error={error} resume={resume}",
+            id.task,
+            id.index
+        );
+        wire::int(2, u64::from(skip), &mut body);
         wire::int(3, error, &mut body);
         wire::int(4, resume, &mut body);
-        self.respond(request_id, 3, &body).await;
+        self.respond(sequence, request_id, 3, &body).await;
     }
 
-    async fn file_block(&self, request_id: u64, fields: &[Field]) {
+    async fn file_block(&self, sequence: u64, request_id: u64, fields: &[Field]) {
         let id = parse_task(fields);
         let block = get_uint(fields, 2);
         let data = wire::blob(fields, 3).unwrap_or_default();
@@ -759,15 +935,21 @@ impl FileTransfer {
                 Err(error) => io_error(&error),
             },
         };
+        tracing::debug!(
+            "file transfer block: task={} index={} block={block} bytes={} error={error}",
+            id.task,
+            id.index,
+            data.len()
+        );
         let mut body = Vec::new();
         wire::bytes(1, &encode_task(id), &mut body);
         wire::int(2, block, &mut body);
         wire::int(3, error, &mut body);
         wire::int(4, data.len() as u64, &mut body);
-        self.respond(request_id, 4, &body).await;
+        self.respond(sequence, request_id, 4, &body).await;
     }
 
-    async fn complete(&self, request_id: u64, fields: &[Field]) {
+    async fn complete(&self, sequence: u64, request_id: u64, fields: &[Field]) {
         let id = parse_task(fields);
         let viewer_error = get_uint(fields, 2);
         let code = {
@@ -794,15 +976,24 @@ impl FileTransfer {
             }
             code
         };
+        tracing::info!(
+            "file transfer complete: task={} index={} viewer_error={viewer_error} code={code}",
+            id.task,
+            id.index
+        );
         let mut body = Vec::new();
         wire::bytes(1, &encode_task(id), &mut body);
         wire::int(2, code, &mut body);
-        self.respond(request_id, 6, &body).await;
+        self.respond(sequence, request_id, 6, &body).await;
     }
 
-    async fn file_operation(&self, request_id: u64, case: u32, fields: &[Field]) {
+    async fn file_operation(&self, sequence: u64, request_id: u64, case: u32, fields: &[Field]) {
         let raw = get_text(fields, if case == 8 { 2 } else { 1 });
-        let path = normalize(&raw);
+        let path = if is_default_target(&raw) {
+            self.save_path.clone()
+        } else {
+            normalize(&raw)
+        };
         let result = match case {
             5 => {
                 let new_name = get_text(fields, 2);
@@ -825,7 +1016,7 @@ impl FileTransfer {
             let mut body = Vec::new();
             wire::bytes(1, &encode_task(parse_task(fields)), &mut body);
             wire::int(2, code, &mut body);
-            self.respond(request_id, 6, &body).await;
+            self.respond(sequence, request_id, 6, &body).await;
             return;
         }
         let mut body = Vec::new();
@@ -834,37 +1025,63 @@ impl FileTransfer {
             wire::bytes(2, error.to_string().as_bytes(), &mut body);
         }
         wire::bytes(3, raw.as_bytes(), &mut body);
-        self.respond(request_id, 5, &body).await;
+        self.respond(sequence, request_id, 5, &body).await;
     }
 
-    async fn file_exist(&self, request_id: u64, fields: &[Field]) {
+    async fn file_exist(&self, sequence: u64, request_id: u64, fields: &[Field]) {
         let raw = get_text(fields, 1);
-        let directory = normalize(&raw);
+        let directory = if is_default_target(&raw) {
+            self.save_path.clone()
+        } else {
+            normalize(&raw)
+        };
         let mut body = Vec::new();
         wire::bytes(1, raw.as_bytes(), &mut body);
-        for name in get_all(fields, 2) {
-            let Ok(name) = std::str::from_utf8(&name) else {
+        let mut existing = 0usize;
+        let names = get_all(fields, 2);
+        for name in &names {
+            let Ok(name) = std::str::from_utf8(name) else {
                 continue;
             };
             let exists = directory.join(name).exists();
+            existing += usize::from(exists);
             let mut result = Vec::new();
             wire::bytes(1, name.as_bytes(), &mut result);
-            if exists {
-                wire::int(2, 1, &mut result);
-            }
+            wire::int(2, u64::from(exists), &mut result);
             wire::bytes(2, &result, &mut body);
         }
-        self.respond(request_id, 8, &body).await;
+        tracing::info!(
+            "file transfer file_exist: path={raw:?} names={} existing={existing}",
+            names.len()
+        );
+        self.respond(sequence, request_id, 8, &body).await;
     }
 
-    async fn send_request(self: &Arc<Self>, request_id: u64, fields: &[Field]) {
+    async fn send_request(self: &Arc<Self>, sequence: u64, request_id: u64, fields: &[Field]) {
         let id = parse_task(fields);
-        let path = normalize(&get_text(fields, 2));
+        let raw = get_text(fields, 2);
+        let path = if is_default_target(&raw) {
+            self.save_path.clone()
+        } else {
+            normalize(&raw)
+        };
+        tracing::info!(
+            "file transfer download: task={} raw={raw:?} path={:?}",
+            id.task,
+            path
+        );
         let collected = collect_download(&path);
         let mut body = Vec::new();
         wire::bytes(1, &encode_task(id), &mut body);
         match collected {
             Ok((folder, files)) => {
+                tracing::info!(
+                    "file transfer download ok: task={} files={} bytes={} folder={:?}",
+                    id.task,
+                    files.len(),
+                    files.iter().map(|(file, _)| file.size).sum::<u64>(),
+                    folder
+                );
                 wire::int(2, FT_SUCCEEDED, &mut body);
                 let infos: Vec<FileInfo> = files.iter().map(|(file, _)| file.clone()).collect();
                 for file in &infos {
@@ -872,7 +1089,7 @@ impl FileTransfer {
                 }
                 wire::bytes(4, folder.as_bytes(), &mut body);
                 wire::bytes(5, &encode_list(&infos), &mut body);
-                self.respond(request_id, 2, &body).await;
+                self.respond(sequence, request_id, 2, &body).await;
                 let transfer = self.clone();
                 tokio::spawn(async move {
                     let _guard = transfer.downloading.lock().await;
@@ -902,8 +1119,13 @@ impl FileTransfer {
                 });
             }
             Err(code) => {
-                wire::int(2, io_error(&code), &mut body);
-                self.respond(request_id, 2, &body).await;
+                let code = io_error(&code);
+                tracing::info!(
+                    "file transfer download failed: task={} error={code}",
+                    id.task
+                );
+                wire::int(2, code, &mut body);
+                self.respond(sequence, request_id, 2, &body).await;
             }
         }
     }
@@ -925,12 +1147,12 @@ impl FileTransfer {
             let Some(confirm) = self.request(3, ask, (3, task, id.index, 0)).await else {
                 return false;
             };
-            let Some(confirm) = wire::decode(&confirm) else {
-                return false;
-            };
-            let skip = get_uint(&confirm, 2) != 0;
-            let error = get_uint(&confirm, 3);
-            let resume = get_uint(&confirm, 4);
+            let [skip, error, resume] = case_uints(&confirm, 3, [2, 3, 4]);
+            let skip = skip != 0;
+            tracing::info!(
+                "file transfer file_ask answered: task={task} index={} skip={skip} error={error} resume={resume}",
+                id.index
+            );
             if error == FT_CANCELED {
                 return false;
             }
@@ -962,6 +1184,12 @@ impl FileTransfer {
         let mut file = std::fs::File::open(path).map_err(|error| io_error(&error))?;
         file.seek(SeekFrom::Start(resume))
             .map_err(|error| io_error(&error))?;
+        tracing::info!(
+            "file transfer sending file: task={} index={} path={:?} resume={resume}",
+            id.task,
+            id.index,
+            path
+        );
         let mut block_id = first_block + resume / DOWNLOAD_BLOCK as u64;
         let mut inflight = tokio::task::JoinSet::new();
         loop {
@@ -991,16 +1219,14 @@ impl FileTransfer {
             let transfer = self.clone();
             inflight.spawn(async move {
                 match transfer.request(4, body, key).await {
-                    Some(response) => wire::decode(&response)
-                        .map(|fields| {
-                            let code = get_uint(&fields, 3);
-                            if code == 0 {
-                                FT_SUCCEEDED
-                            } else {
-                                code
-                            }
-                        })
-                        .unwrap_or(FT_IO),
+                    Some(response) => {
+                        let [code] = case_uints(&response, 4, [3]);
+                        if code == 0 {
+                            FT_SUCCEEDED
+                        } else {
+                            code
+                        }
+                    }
                     None => FT_IO,
                 }
             });
@@ -1040,6 +1266,17 @@ fn response_key(ftp: &[u8]) -> Option<(u32, TaskId, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_target_maps_to_the_save_directory() {
+        assert!(is_default_target(":/Default"));
+        assert!(is_default_target(":/default/"));
+        assert!(is_default_target("Default"));
+        assert!(is_default_target("dEfAuLt"));
+        assert!(!is_default_target(":/"));
+        assert!(!is_default_target("/home/user/default"));
+        assert!(!is_default_target("/Default"));
+    }
 
     #[test]
     fn translates_windows_paths_without_escaping_root() {

@@ -498,14 +498,17 @@ fn install_host_channels_legacy(
                         let _ = channel_for_file.send(&bytes::Bytes::from(message)).await;
                     }
                 });
+                let file_sequence = Arc::new(std::sync::atomic::AtomicU64::new(1));
                 Some((
                     crate::uu_native::port_mapping::PortMapping::new(
                         file_tx.clone(),
-                        Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                        file_sequence.clone(),
                     ),
                     crate::uu_native::file_transfer::FileTransfer::new(
                         file_tx,
+                        None,
                         Config::default().file_save_path(),
+                        file_sequence,
                     ),
                 ))
             } else {
@@ -590,7 +593,9 @@ fn install_host_channels_legacy(
                             if port_mapping.handle(&data, &label) {
                                 return;
                             }
-                            if label == "FILE_DATA_CHANNEL" && file_transfer.handle(&data).await {
+                            if label == "FILE_DATA_CHANNEL"
+                                && file_transfer.handle(&data, &label).await
+                            {
                                 return;
                             }
                         }
@@ -851,7 +856,110 @@ fn install_host_channels(
     let sequence = Arc::new(AtomicU64::new(1));
     let clipboard_ready = Arc::new(AtomicBool::new(false));
     let sound = crate::desktop::audio::enabled();
-    let save_location = config.file_save_path().to_string_lossy().into_owned();
+    let save_path = config.file_save_path();
+    let save_location = save_path.to_string_lossy().into_owned();
+    // One file-transfer session per peer. Viewers send FileTransferFtp RPCs on
+    // CONTROL (the official host accepts TEXT and FILE too), while replies and
+    // host-initiated requests travel on FILE_DATA_CHANNEL. Create the session
+    // up front so those requests are not dropped when they arrive on CONTROL.
+    let (file_tx, mut file_rx) = mpsc::channel::<Vec<u8>>(64);
+    // The viewer may close and reopen FILE_DATA_CHANNEL between transfers.
+    // Forward through whichever channel is current instead of binding the
+    // queue to the first one, and never tear down the per-peer session on a
+    // channel close.
+    let file_channel: Arc<Mutex<Option<Arc<webrtc::data_channel::RTCDataChannel>>>> =
+        Arc::new(Mutex::new(None));
+    {
+        let file_channel = file_channel.clone();
+        tokio::spawn(async move {
+            while let Some(message) = file_rx.recv().await {
+                let bytes = message.len();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let target = loop {
+                    if let Some(channel) = file_channel.lock().unwrap().clone() {
+                        break Some(channel);
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        break None;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                };
+                match target {
+                    Some(channel) => {
+                        if channel.send(&bytes::Bytes::from(message)).await.is_err() {
+                            tracing::debug!("FILE channel send failed for {bytes} bytes");
+                        } else {
+                            tracing::debug!("FILE channel sent {bytes} bytes");
+                        }
+                    }
+                    None => tracing::debug!("FILE channel missing; dropped {bytes} bytes"),
+                }
+            }
+        });
+    }
+    let control_channel: Arc<Mutex<Option<Arc<webrtc::data_channel::RTCDataChannel>>>> =
+        Arc::new(Mutex::new(None));
+    let text_channel: Arc<Mutex<Option<Arc<webrtc::data_channel::RTCDataChannel>>>> =
+        Arc::new(Mutex::new(None));
+    // Official viewers do not always read RPC replies from FILE_DATA_CHANNEL;
+    // mirror each reply onto the channel its request arrived on.
+    let (mirror_tx, mut mirror_rx) = mpsc::channel::<(String, Vec<u8>)>(64);
+    {
+        let control_channel = control_channel.clone();
+        let text_channel = text_channel.clone();
+        tokio::spawn(async move {
+            while let Some((label, message)) = mirror_rx.recv().await {
+                let slot = match label.as_str() {
+                    "CONTROL_DATA_CHANNEL" => control_channel.clone(),
+                    "TEXT_DATA_CHANNEL" => text_channel.clone(),
+                    _ => continue,
+                };
+                let bytes = message.len();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let target = loop {
+                    let target = slot.lock().unwrap().clone();
+                    if target.is_some() {
+                        break target;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        break None;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                };
+                match target {
+                    Some(channel) => {
+                        if channel.send(&bytes::Bytes::from(message)).await.is_err() {
+                            tracing::debug!("{label} file mirror send failed for {bytes} bytes");
+                        } else {
+                            tracing::debug!("{label} file mirror sent {bytes} bytes");
+                        }
+                    }
+                    None => tracing::debug!("{label} file mirror missing; dropped {bytes} bytes"),
+                }
+            }
+        });
+    }
+    let file_transfer = Arc::new(crate::uu_native::file_transfer::FileTransfer::new(
+        file_tx.clone(),
+        Some(mirror_tx),
+        save_path,
+        sequence.clone(),
+    ));
+    let port_mapping =
+        crate::uu_native::port_mapping::PortMapping::new(file_tx, Arc::new(AtomicU64::new(1)));
+    {
+        // Like the reference host: port-mapping streams live for the peer, not
+        // for one FILE_DATA_CHANNEL incarnation.
+        let pc = pc.clone();
+        let mapping = port_mapping.clone();
+        tokio::spawn(async move {
+            use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState as State;
+            while !matches!(pc.connection_state(), State::Closed | State::Failed) {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            mapping.shutdown();
+        });
+    }
     let capture_change_type = if capture_type == 2 { 1u32 } else { 0u32 };
     let desktop_requested = matches!(capture_type, 1 | 2);
     let advertised_fps = crate::desktop::encoder::display_fps();
@@ -873,7 +981,11 @@ fn install_host_channels(
         let sequence = sequence.clone();
         let clipboard_ready = clipboard_ready.clone();
         let save_location = save_location.clone();
-        let config = config.clone();
+        let file_transfer = file_transfer.clone();
+        let port_mapping = port_mapping.clone();
+        let file_channel = file_channel.clone();
+        let control_channel = control_channel.clone();
+        let text_channel = text_channel.clone();
         Box::pin(async move {
             tracing::info!("native UU data channel opened: {label}");
 
@@ -886,39 +998,51 @@ fn install_host_channels(
                 }));
             }
 
-            let port_mapping = if label == "FILE_DATA_CHANNEL" {
-                let (file_tx, mut file_rx) = mpsc::channel::<Vec<u8>>(64);
-                let channel_for_file = channel.clone();
-                tokio::spawn(async move {
-                    while let Some(message) = file_rx.recv().await {
-                        if channel_for_file
-                            .send(&bytes::Bytes::from(message))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                });
-                Some((
-                    crate::uu_native::port_mapping::PortMapping::new(
-                        file_tx.clone(),
-                        Arc::new(AtomicU64::new(1)),
-                    ),
-                    Arc::new(crate::uu_native::file_transfer::FileTransfer::new(
-                        file_tx,
-                        config.file_save_path(),
-                    )),
-                ))
-            } else {
-                None
-            };
-            if let Some((mapping, transfer)) = &port_mapping {
-                let mapping = mapping.clone();
-                let transfer = transfer.clone();
+            if label == "CONTROL_DATA_CHANNEL" {
+                *control_channel.lock().unwrap() = Some(channel.clone());
+                let slot = control_channel.clone();
+                let closing = channel.clone();
                 channel.on_close(Box::new(move || {
-                    mapping.shutdown();
-                    transfer.shutdown();
+                    let mut current = slot.lock().unwrap();
+                    if current
+                        .as_ref()
+                        .is_some_and(|open| Arc::ptr_eq(open, &closing))
+                    {
+                        *current = None;
+                    }
+                    Box::pin(async {})
+                }));
+            }
+
+            if label == "TEXT_DATA_CHANNEL" {
+                *text_channel.lock().unwrap() = Some(channel.clone());
+                let slot = text_channel.clone();
+                let closing = channel.clone();
+                channel.on_close(Box::new(move || {
+                    let mut current = slot.lock().unwrap();
+                    if current
+                        .as_ref()
+                        .is_some_and(|open| Arc::ptr_eq(open, &closing))
+                    {
+                        *current = None;
+                    }
+                    Box::pin(async {})
+                }));
+            }
+
+            if label == "FILE_DATA_CHANNEL" {
+                *file_channel.lock().unwrap() = Some(channel.clone());
+                let slot = file_channel.clone();
+                let closing = channel.clone();
+                channel.on_close(Box::new(move || {
+                    tracing::info!("native UU data channel closed: FILE_DATA_CHANNEL");
+                    let mut current = slot.lock().unwrap();
+                    if current
+                        .as_ref()
+                        .is_some_and(|open| Arc::ptr_eq(open, &closing))
+                    {
+                        *current = None;
+                    }
                     Box::pin(async {})
                 }));
             }
@@ -1163,6 +1287,7 @@ fn install_host_channels(
                     let clipboard_assembly = clipboard_assembly.clone();
                     let clipboard_ready = clipboard_ready.clone();
                     let port_mapping = port_mapping.clone();
+                    let file_transfer = file_transfer.clone();
                     let actions = actions.clone();
                     let sequence = sequence.clone();
                     let save_location = save_location.clone();
@@ -1170,13 +1295,17 @@ fn install_host_channels(
                     let lock_watch = crate::desktop::session_lock::watch_locked();
                     Box::pin(async move {
                         let data = message.data.to_vec();
-                        if let Some((port_mapping, file_transfer)) = &port_mapping {
-                            if port_mapping.handle(&data, &label) {
-                                return;
-                            }
-                            if label == "FILE_DATA_CHANNEL" && file_transfer.handle(&data).await {
-                                return;
-                            }
+                        if port_mapping.handle(&data, &label) {
+                            return;
+                        }
+                        // Viewers put FileTransferFtp RPCs on CONTROL; accept
+                        // them on TEXT and FILE as well, like the official host.
+                        if matches!(
+                            label.as_str(),
+                            "CONTROL_DATA_CHANNEL" | "TEXT_DATA_CHANNEL" | "FILE_DATA_CHANNEL"
+                        ) && file_transfer.handle(&data, &label).await
+                        {
+                            return;
                         }
                         if label == "BINARY_DATA_CHANNEL" && term::is_frame(&data) {
                             terminal.handle(&data);

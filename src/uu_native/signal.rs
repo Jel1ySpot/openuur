@@ -179,7 +179,28 @@ impl Signal {
         let tx = out_tx.clone();
         tokio::spawn(async move {
             let mut pending: Option<(String, Value, usize, Vec<Vec<u8>>)> = None;
-            while let Some(message) = reader.next().await {
+            // The official controlled session refreshes its reconnect key every
+            // 30s (first refresh 30s after the socket.io namespace connects).
+            // Without it the server closes the namespace after about 30s, which
+            // used to tear down every active peer.
+            let mut next_refresh = tokio::time::Instant::now() + Duration::from_secs(30);
+            let mut refresh_id: u64 = 1000;
+            loop {
+                let message = tokio::select! {
+                    _ = tokio::time::sleep_until(next_refresh) => {
+                        refresh_id += 1;
+                        let packet = format!("42{refresh_id}[\"refresh_reconnect_key\"]");
+                        if out_tx.send(Message::Text(packet.into())).is_err() {
+                            break;
+                        }
+                        tracing::debug!("signaling reconnect-key refresh id={refresh_id}");
+                        next_refresh =
+                            tokio::time::Instant::now() + Duration::from_secs(30);
+                        continue;
+                    }
+                    message = reader.next() => message,
+                };
+                let Some(message) = message else { break };
                 let message = match message {
                     Ok(message) => message,
                     Err(_) => {

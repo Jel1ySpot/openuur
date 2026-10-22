@@ -21,6 +21,33 @@ const LANGUAGE: &str = "zh-CN";
 const COUNTRY: &str = "CN";
 const PLATFORM: &str = "1";
 
+/// Prefer IPv4 for the UU HTTP API. A broken IPv6 route (for example a tunnel
+/// that accepts TCP but drops the TLS handshake) otherwise takes the client
+/// offline because hyper does not fall back to IPv4 after a TLS failure.
+#[derive(Debug)]
+struct Ipv4Resolver;
+
+impl reqwest::dns::Resolve for Ipv4Resolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let host = name.as_str().to_owned();
+            let mut ipv4 = Vec::new();
+            let mut all = Vec::new();
+            for addr in tokio::net::lookup_host((host.as_str(), 0)).await? {
+                all.push(addr);
+                if addr.is_ipv4() {
+                    ipv4.push(addr);
+                }
+            }
+            let addrs = if ipv4.is_empty() { all } else { ipv4 };
+            if addrs.is_empty() {
+                return Err("no addresses returned".into());
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct ApiClient {
     http: Client,
@@ -35,6 +62,7 @@ pub struct ApiClient {
 impl ApiClient {
     pub fn new(base: impl Into<String>, token: Option<String>) -> Result<Self> {
         let http = Client::builder()
+            .dns_resolver(std::sync::Arc::new(Ipv4Resolver))
             .timeout(Duration::from_secs(30))
             .user_agent(format!("openuur/{}", crate::VERSION))
             .build()?;

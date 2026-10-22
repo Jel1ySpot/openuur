@@ -71,3 +71,6 @@ zbus = { version = "5", default-features = false, features = ["tokio"] }
 # UU interop needs the post-handshake DTLS delivery fix from this vendored 0.9.0 copy.
 [patch.crates-io]
 webrtc-dtls = { path = "vendor/webrtc-dtls" }
+# Larger data-channel receive buffer (200 KiB file-transfer blocks) and an
+# SCTP send limit that matches the advertised a=max-message-size.
+webrtc = { path = "vendor/webrtc" }
