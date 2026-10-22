@@ -49,10 +49,11 @@ enum Command {
     },
     /// Connect to a device's UU native terminal.
     Term(TermArgs),
-    /// Install and enable openuurd as a systemd service.
+    /// Install and enable openuurd under the system's init.
     ///
     /// Run as a normal user for a user service; run through sudo for a system
-    /// service for the invoking account.
+    /// service for the invoking account. System services start at boot, before
+    /// the graphical session exists.
     Install(InstallArgs),
 }
 
@@ -64,9 +65,15 @@ struct InstallArgs {
     /// System install only: account that owns the graphical session.
     #[arg(long)]
     user: Option<String>,
-    /// Write and enable the unit without starting it now.
+    /// Write and enable the service without starting it now.
     #[arg(long)]
     no_start: bool,
+    /// Init system: auto, systemd, openrc, runit, s6, sysv or xdg.
+    #[arg(long, value_name = "INIT")]
+    init: Option<String>,
+    /// Service scope: auto, system or user.
+    #[arg(long, value_name = "SCOPE")]
+    scope: Option<String>,
 }
 
 #[derive(Args)]
@@ -158,6 +165,8 @@ async fn real_main() -> anyhow::Result<()> {
                 config: cli.config.clone(),
                 user: args.user,
                 no_start: args.no_start,
+                init: args.init,
+                scope: args.scope,
             })
             .map_err(anyhow::Error::msg)?;
             print_install_report(&report);
@@ -417,8 +426,9 @@ async fn fetch_devices(config: &mut Config) -> anyhow::Result<Vec<openuur::api::
 
 fn print_install_report(report: &openuur::install::InstallReport) {
     println!(
-        "installed {} service: {}",
-        if report.system { "system" } else { "user" },
+        "installed {} {} service: {}",
+        report.scope,
+        report.init,
         report.unit_path.display()
     );
     if let Some(user) = &report.user {
@@ -427,24 +437,60 @@ fn print_install_report(report: &openuur::install::InstallReport) {
     println!("binary: {}", report.binary.display());
     println!("config: {}", report.config.display());
     if report.enabled {
-        println!(
-            "service: enabled{}",
-            if report.started { " and started" } else { "" }
-        );
-    } else {
-        println!("service: unit written but could not be enabled");
-        if report.system {
-            println!(
-                "  sudo systemctl daemon-reload && sudo systemctl enable --now openuurd.service"
-            );
+        if report.started {
+            println!("service: enabled and started");
         } else {
-            println!(
-                "  systemctl --user daemon-reload && systemctl --user enable --now openuurd.service"
-            );
+            println!("service: enabled");
+            if let Some(hint) = start_hint(report) {
+                println!("  {hint}");
+            }
         }
+    } else {
+        println!("service: files written but could not be enabled");
+        println!("  {}", enable_hint(report));
+    }
+    if report.scope == openuur::install::Scope::System {
+        println!(
+            "note: terminal, file transfer and port mapping are available before login; \
+             the desktop attaches after the account logs in (the greeter is never captured)"
+        );
     }
     for warning in &report.warnings {
         eprintln!("warning: {warning}");
+    }
+}
+
+fn start_hint(report: &openuur::install::InstallReport) -> Option<&'static str> {
+    use openuur::install::{Init, Scope};
+    Some(match (report.init, report.scope) {
+        (Init::Xdg, _) => "starts at the next login",
+        (Init::Systemd, Scope::System) => "sudo systemctl start openuurd.service",
+        (Init::Systemd, Scope::User) => "systemctl --user start openuurd.service",
+        (Init::OpenRC, _) => "sudo rc-service openuurd start",
+        (Init::Runit, _) => "sudo sv up openuurd",
+        (Init::S6, _) => "sudo s6-svscanctl -a /run/service",
+        (Init::Sysv, _) => "sudo service openuurd start",
+    })
+}
+
+fn enable_hint(report: &openuur::install::InstallReport) -> &'static str {
+    use openuur::install::{Init, Scope};
+    match (report.init, report.scope) {
+        (Init::Systemd, Scope::System) => {
+            "sudo systemctl daemon-reload && sudo systemctl enable --now openuurd.service"
+        }
+        (Init::Systemd, Scope::User) => {
+            "systemctl --user daemon-reload && systemctl --user enable --now openuurd.service"
+        }
+        (Init::OpenRC, _) => "sudo rc-update add openuurd default && sudo rc-service openuurd start",
+        (Init::Runit, _) => {
+            "sudo ln -s /etc/sv/openuurd /var/service/ && sudo sv up openuurd"
+        }
+        (Init::S6, _) => {
+            "add /etc/s6/sv/openuurd to your s6-rc source directory, rebuild the database, then s6-svscanctl -a /run/service"
+        }
+        (Init::Sysv, _) => "sudo update-rc.d openuurd defaults && sudo service openuurd start",
+        (Init::Xdg, _) => "the desktop entry starts at the next login",
     }
 }
 

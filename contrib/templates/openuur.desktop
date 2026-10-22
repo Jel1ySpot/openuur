@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=openuur
+Comment=UU Remote native host
+Exec=/usr/local/bin/openuurd run --config /home/alice/.local/state/openuur/config.toml
+Terminal=false
+X-GNOME-Autostart-enabled=true

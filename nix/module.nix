@@ -16,6 +16,9 @@ let
     // lib.optionalAttrs (cfg.displaySource != null) {
       display_source = cfg.displaySource;
     }
+    // lib.optionalAttrs (cfg.desktopBackend != "auto") {
+      desktop_backend = cfg.desktopBackend;
+    }
     // lib.optionalAttrs (cfg.fileSavePath != null) {
       file_save_path = toString cfg.fileSavePath;
     }
@@ -45,20 +48,9 @@ let
       };
   runtimeDir = "/run/user/${toString user.uid}";
 
-  # A system service does not inherit the compositor environment. Detect the
-  # user's Wayland socket at start so wayland-0/wayland-1 both work.
-  startScript = pkgs.writeShellScript "openuurd-start" ''
-    if [ -z "''${WAYLAND_DISPLAY:-}" ] && [ -n "''${XDG_RUNTIME_DIR:-}" ]; then
-      for socket in "$XDG_RUNTIME_DIR"/wayland-*; do
-        if [ -S "$socket" ]; then
-          export WAYLAND_DISPLAY="$(basename "$socket")"
-          break
-        fi
-      done
-    fi
-    exec ${cfg.package}/bin/openuurd "$@"
-  '';
-
+  # A system service does not inherit the compositor environment. The daemon
+  # discovers the graphical session (and its Wayland socket) at runtime, so the
+  # unit intentionally does not snapshot WAYLAND_DISPLAY or XDG_SESSION_TYPE.
   execArgs =
     [ "run" ]
     ++ lib.optionals (configPath != null) [
@@ -73,7 +65,6 @@ let
     XDG_STATE_HOME = "${user.home}/.local/state";
     XDG_RUNTIME_DIR = runtimeDir;
     DBUS_SESSION_BUS_ADDRESS = "unix:path=${runtimeDir}/bus";
-    XDG_SESSION_TYPE = "wayland";
     RUST_LOG = "openuur=info,openuurd=info";
   };
 
@@ -108,6 +99,9 @@ let
     }
     // lib.optionalAttrs (!cfg.portMapping) {
       UU_PORT_MAPPING = "0";
+    }
+    // lib.optionalAttrs (!cfg.preventSleep) {
+      UU_PREVENT_SLEEP = "0";
     }
     // cfg.environment;
 in
@@ -214,7 +208,31 @@ in
         ]
       );
       default = null;
-      description = "Portal capture source. Written to `display_source`.";
+      description = "Capture source. Written to `display_source`.";
+    };
+
+    desktopBackend = lib.mkOption {
+      type = types.enum [
+        "auto"
+        "portal"
+        "x11"
+        "wlroots"
+      ];
+      default = "auto";
+      description = ''
+        Capture backend written to `desktop_backend`. `auto` picks X11 for
+        Xorg sessions, the portal for GNOME/KDE Wayland, and the native
+        wlroots backend for other Wayland compositors.
+      '';
+    };
+
+    preventSleep = lib.mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Inhibit system sleep and idle while a remote desktop peer is connected
+        (`UU_PREVENT_SLEEP=0` when disabled).
+      '';
     };
 
     fileSavePath = lib.mkOption {
@@ -333,7 +351,7 @@ in
       }
       {
         assertion = !(cfg.configFile != null && settings != { });
-        message = "services.openuur.configFile cannot be combined with settings/displaySource/fileSavePath; put those keys in the config file.";
+        message = "services.openuur.configFile cannot be combined with settings/displaySource/desktopBackend/fileSavePath; put those keys in the config file.";
       }
       {
         assertion = !(settings ? token);
@@ -356,7 +374,7 @@ in
         {
           Type = "simple";
           User = cfg.user;
-          ExecStart = "${startScript} ${lib.escapeShellArgs execArgs}";
+          ExecStart = "${cfg.package}/bin/openuurd ${lib.escapeShellArgs execArgs}";
           Restart = cfg.restart;
           RestartSec = cfg.restartSec;
           WorkingDirectory = user.home;

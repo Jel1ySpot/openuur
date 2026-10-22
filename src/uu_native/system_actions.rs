@@ -73,6 +73,15 @@ fn quiet(program: &str, args: &[&str]) -> bool {
         .is_ok_and(|status| status.success())
 }
 
+/// Reboot or power off across init systems. systemd gives the best polkit
+/// integration; logind's own action works without it, and the portable
+/// commands cover OpenRC, runit, s6 and SysV (where the daemon may be root).
+fn power_action(action: &str) -> bool {
+    quiet("systemctl", &["--no-ask-password", action])
+        || quiet("loginctl", &[action])
+        || quiet(action, &[])
+}
+
 fn detached(program: &str, args: &[&str]) -> bool {
     Command::new(program)
         .args(args)
@@ -234,18 +243,12 @@ impl PeerActions {
             }
             action::REBOOT_SYSTEM => {
                 tracing::warn!("system action: reboot requested by viewer");
-                tracing::info!(
-                    "reboot ok={}",
-                    quiet("systemctl", &["--no-ask-password", "reboot"])
-                );
+                tracing::info!("reboot ok={}", power_action("reboot"));
                 return false;
             }
             action::SHUTDOWN_SYSTEM => {
                 tracing::warn!("system action: shutdown requested by viewer");
-                tracing::info!(
-                    "poweroff ok={}",
-                    quiet("systemctl", &["--no-ask-password", "poweroff"])
-                );
+                tracing::info!("poweroff ok={}", power_action("poweroff"));
                 return false;
             }
             _ => {}

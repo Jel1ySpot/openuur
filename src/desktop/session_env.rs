@@ -787,6 +787,12 @@ fn unavailable_or_last(error: String) -> SessionState {
 /// A session derived from this process's own environment, verified against the
 /// runtime directory. Used only when logind is unreachable.
 fn process_env_session() -> Option<SessionEnv> {
+    // A service that runs as root must not adopt a display-manager or another
+    // user's environment; logind is the only trusted source there. This also
+    // keeps the greeter out of reach on systems without logind.
+    if unsafe { libc::geteuid() == 0 } && std::env::var_os("UU_SESSION_ENV_FALLBACK").is_none() {
+        return None;
+    }
     let leader = LeaderEnv::from_process_env();
     let uid = target_uid();
     let session_type = leader
@@ -814,7 +820,10 @@ fn process_env_session() -> Option<SessionEnv> {
             }
             scan_wayland_sockets(&runtime_dir)
         }
-        SessionType::X11 => Vec::new(),
+        SessionType::X11 => {
+            leader.x11_display.as_ref()?;
+            Vec::new()
+        }
     };
     let record = SessionRecord {
         id: leader.xdg_session_id.clone().unwrap_or_default(),

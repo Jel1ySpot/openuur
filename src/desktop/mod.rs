@@ -153,15 +153,19 @@ pub fn backend_for_source(
     source: SourceKind,
     automatic: bool,
 ) -> Result<Backend, String> {
-    if selection.effective != Backend::Wlroots || source == SourceKind::Monitor {
+    if source == SourceKind::Monitor {
         return Ok(selection.effective);
     }
-    if automatic {
-        Ok(Backend::Wayland)
-    } else {
-        Err("the native wlroots backend captures whole outputs; use \
+    match selection.effective {
+        // Only the portal can capture a window or a compositor virtual source.
+        Backend::Wlroots | Backend::X11 if automatic => Ok(Backend::Wayland),
+        Backend::Wlroots => Err("the native wlroots backend captures whole outputs; use \
              --desktop-backend portal for window or virtual sources"
-            .to_owned())
+            .to_owned()),
+        Backend::X11 => Err("the native X11 backend captures whole outputs; use \
+             --desktop-backend portal for window or virtual sources"
+            .to_owned()),
+        Backend::Wayland => Ok(Backend::Wayland),
     }
 }
 
@@ -647,6 +651,22 @@ mod tests {
             backend_for_source(portal, SourceKind::Window, false),
             Ok(Backend::Wayland)
         );
+    }
+
+    #[test]
+    fn window_sources_use_the_portal_on_x11_desktops() {
+        let session = env(SessionType::X11, DesktopKind::Other);
+        let selection = effective_selection(BackendChoice::Auto, &session);
+        assert_eq!(selection.effective, Backend::X11);
+        assert_eq!(
+            backend_for_source(selection, SourceKind::Monitor, true),
+            Ok(Backend::X11)
+        );
+        assert_eq!(
+            backend_for_source(selection, SourceKind::Window, true),
+            Ok(Backend::Wayland)
+        );
+        assert!(backend_for_source(selection, SourceKind::Virtual, false).is_err());
     }
 
     #[test]

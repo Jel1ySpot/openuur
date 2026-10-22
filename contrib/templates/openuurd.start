@@ -1,0 +1,8 @@
+#!/bin/sh
+# Shared launcher for OpenRC/runit/s6/SysV installs.
+# Adjust the account paths and binary location, then chmod 755.
+export HOME='/home/alice'
+export XDG_RUNTIME_DIR='/run/user/1000'
+export DBUS_SESSION_BUS_ADDRESS='unix:path=/run/user/1000/bus'
+export RUST_LOG='openuur=info,openuurd=info'
+exec '/usr/local/bin/openuurd' run --config '/home/alice/.local/state/openuur/config.toml'

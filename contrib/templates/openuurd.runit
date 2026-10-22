@@ -1,0 +1,4 @@
+#!/bin/sh
+# runit service: install as /etc/sv/openuurd/run and link into /var/service.
+exec 2>&1
+exec chpst -u alice /etc/openuur/start

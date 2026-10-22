@@ -130,8 +130,19 @@ pub async fn run(config: Config, password: Option<String>) -> Result<()> {
         outbox: Outbox::new(),
     };
     let mut backoff = Duration::from_secs(3);
-    loop {
-        match enter_room(&config, &mut runtime).await {
+    // Registered once for the whole process: during reconnect backoff and
+    // capture startup, SIGTERM must still stop the daemon cleanly.
+    let mut terminate =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    let mut interrupt =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
+    'run: loop {
+        let exit = tokio::select! {
+            exit = enter_room(&config, &mut runtime) => exit,
+            _ = wait_for_shutdown(&mut terminate) => RoomExit::Shutdown,
+            _ = wait_for_shutdown(&mut interrupt) => RoomExit::Shutdown,
+        };
+        match exit {
             RoomExit::Shutdown => break,
             RoomExit::Reconnect { error, connected } => {
                 tracing::warn!("native UU host: {error}");
@@ -146,6 +157,8 @@ pub async fn run(config: Config, password: Option<String>) -> Result<()> {
                 loop {
                     tokio::select! {
                         _ = tokio::time::sleep_until(deadline) => break,
+                        _ = wait_for_shutdown(&mut terminate) => break 'run,
+                        _ = wait_for_shutdown(&mut interrupt) => break 'run,
                         changed = session_rx.changed() => {
                             if changed.is_err() {
                                 tokio::time::sleep_until(deadline).await;
@@ -200,10 +213,6 @@ async fn room_loop(config: &Config, runtime: &mut HostRuntime, signal: &mut Sign
     // Apply a session change that happened while signaling was disconnected.
     let current = session_rx.borrow_and_update().available().cloned();
     close_desktop_peers(runtime, current.as_ref()).await;
-    let mut terminate =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
-    let mut interrupt =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
 
     loop {
         tokio::select! {
@@ -260,8 +269,6 @@ async fn room_loop(config: &Config, runtime: &mut HostRuntime, signal: &mut Sign
                     cancel_pending_desktop(runtime);
                 }
             }
-            _ = wait_for_shutdown(&mut terminate) => return RoomExit::Shutdown,
-            _ = wait_for_shutdown(&mut interrupt) => return RoomExit::Shutdown,
         }
     }
 }
@@ -1389,7 +1396,9 @@ fn install_host_channels(
                             crate::uu_native::system_metrics::remote_download_path(&ready_location);
                         send_framed(&ready_channel, &ready_sequence, 26, &download_path).await;
                                 let state = initialization::secure_desktop(
-                                    crate::desktop::session_lock::locked_now() == Some(true),
+                                    crate::desktop::session_lock::effective_locked(
+                                        crate::desktop::session_lock::locked_now(),
+                                    ),
                                     false,
                                     crate::desktop::session_lock::supported(),
                                 );
@@ -1431,7 +1440,9 @@ fn install_host_channels(
                         let permissions =
                             initialization::permissions(false, true, true, sound, false);
                         send_framed(&ready_channel, &ready_sequence, 15, &permissions).await;
-                        let locked = crate::desktop::session_lock::locked_now() == Some(true);
+                        let locked = crate::desktop::session_lock::effective_locked(
+                            crate::desktop::session_lock::locked_now(),
+                        );
                         let state = initialization::secure_desktop(
                             locked,
                             false,
@@ -1933,7 +1944,9 @@ fn install_host_channels(
 
                         if let Some(id) = initialization::query_system_state(&data) {
                             if id == 1 {
-                                let locked = crate::desktop::session_lock::locked_now() == Some(true);
+                                let locked = crate::desktop::session_lock::effective_locked(
+                            crate::desktop::session_lock::locked_now(),
+                        );
                                 let body = initialization::secure_desktop(
                                     locked,
                                     false,
@@ -2111,8 +2124,12 @@ async fn handle_soac(
                 None
             };
             if matches!(capture_type, 1 | 2) && desktop.is_none() {
-                tracing::warn!("native UU desktop offer without a usable capture; rejecting peer");
-                return;
+                // Answer anyway: the CONTROL channel reports "capture
+                // unavailable" so a pre-login or failed-portal offer fails
+                // visibly instead of timing out unanswered.
+                tracing::warn!(
+                    "native UU desktop offer without a usable capture; answering without video"
+                );
             }
             if let Some(started) = &desktop {
                 if session_env::current().map(|env| env.identity())

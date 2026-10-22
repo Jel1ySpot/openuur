@@ -285,10 +285,11 @@ fn pam_check(user: &str, password: &str) -> i32 {
 }
 
 /// Auto unlock is offered when a graphical logind session exists and PAM can
-/// be loaded.
+/// be loaded. Only PAM availability is cached: a pre-login query must not
+/// freeze "no session yet" into the answer.
 pub fn supported() -> bool {
-    static SUPPORTED: OnceLock<bool> = OnceLock::new();
-    *SUPPORTED.get_or_init(|| pam_available() && display_session().is_some())
+    static PAM_AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *PAM_AVAILABLE.get_or_init(pam_available) && display_session().is_some()
 }
 
 /// Lock state with the policy for unknown values applied: unknown counts as

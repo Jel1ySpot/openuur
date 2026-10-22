@@ -1,0 +1,33 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          openuurd
+# Required-Start:    $network $remote_fs $syslog
+# Required-Stop:     $network $remote_fs $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: openuur UU native host
+### END INIT INFO
+
+PIDFILE=/run/openuurd.pid
+
+case "$1" in
+    start)
+        start-stop-daemon --start --quiet --background --make-pidfile \
+            --pidfile "$PIDFILE" --chuid alice --exec /etc/openuur/start
+        ;;
+    stop)
+        start-stop-daemon --stop --quiet --retry TERM/10/KILL/5 --pidfile "$PIDFILE"
+        rm -f "$PIDFILE"
+        ;;
+    restart)
+        "$0" stop
+        "$0" start
+        ;;
+    status)
+        start-stop-daemon --status --quiet --pidfile "$PIDFILE"
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 2
+        ;;
+esac

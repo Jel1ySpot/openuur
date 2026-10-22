@@ -1,0 +1,13 @@
+#!/sbin/openrc-run
+description="openuur UU native host"
+command="/etc/openuur/start"
+command_user=alice
+command_background=yes
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/openuurd.log"
+error_log="/var/log/openuurd.log"
+
+depend() {
+    need net
+    after dbus
+}
