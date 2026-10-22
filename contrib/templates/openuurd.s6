@@ -2,4 +2,4 @@
 # s6 longrun: install as /etc/s6/sv/openuurd/run with a sibling `type`
 # containing "longrun", then link into the scan directory.
 exec 2>&1
-exec s6-setuidgid alice /etc/openuur/start
+exec s6-setuidgid alice /etc/openuurd/start

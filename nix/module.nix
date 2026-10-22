@@ -16,9 +16,6 @@ let
     // lib.optionalAttrs (cfg.displaySource != null) {
       display_source = cfg.displaySource;
     }
-    // lib.optionalAttrs (cfg.desktopBackend != "auto") {
-      desktop_backend = cfg.desktopBackend;
-    }
     // lib.optionalAttrs (cfg.fileSavePath != null) {
       file_save_path = toString cfg.fileSavePath;
     }
@@ -103,6 +100,9 @@ let
     // lib.optionalAttrs (!cfg.preventSleep) {
       UU_PREVENT_SLEEP = "0";
     }
+    // lib.optionalAttrs (cfg.desktopBackend != "auto") {
+      UU_DESKTOP_BACKEND = cfg.desktopBackend;
+    }
     // cfg.environment;
 in
 {
@@ -160,8 +160,9 @@ in
       default = null;
       example = "wayland-1";
       description = ''
-        Wayland display socket name. When null, the start script detects the
-        first `$XDG_RUNTIME_DIR/wayland-*` socket at runtime.
+        Optional initial Wayland socket name. The daemon discovers the
+        account's graphical session through logind and replaces this value at
+        runtime; leave it null unless session discovery needs a fallback.
       '';
     };
 
@@ -220,9 +221,9 @@ in
       ];
       default = "auto";
       description = ''
-        Capture backend written to `desktop_backend`. `auto` picks X11 for
-        Xorg sessions, the portal for GNOME/KDE Wayland, and the native
-        wlroots backend for other Wayland compositors.
+        Capture backend (`UU_DESKTOP_BACKEND`). `auto` picks X11 for Xorg
+        sessions, the portal for GNOME/KDE Wayland, and the native wlroots
+        backend for other Wayland compositors.
       '';
     };
 
@@ -230,7 +231,7 @@ in
       type = types.bool;
       default = true;
       description = ''
-        Inhibit system sleep and idle while a remote desktop peer is connected
+        Inhibit system sleep and idle while any remote peer is connected
         (`UU_PREVENT_SLEEP=0` when disabled).
       '';
     };
@@ -351,7 +352,7 @@ in
       }
       {
         assertion = !(cfg.configFile != null && settings != { });
-        message = "services.openuur.configFile cannot be combined with settings/displaySource/desktopBackend/fileSavePath; put those keys in the config file.";
+        message = "services.openuur.configFile cannot be combined with settings/displaySource/fileSavePath; put those keys in the config file.";
       }
       {
         assertion = !(settings ? token);
@@ -374,7 +375,7 @@ in
         {
           Type = "simple";
           User = cfg.user;
-          ExecStart = "${cfg.package}/bin/openuurd ${lib.escapeShellArgs execArgs}";
+          ExecStart = "${cfg.package}/bin/openuurd ${config.systemd.lib.escapeSystemdExecArgs execArgs}";
           Restart = cfg.restart;
           RestartSec = cfg.restartSec;
           WorkingDirectory = user.home;

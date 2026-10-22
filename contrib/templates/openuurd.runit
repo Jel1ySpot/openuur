@@ -1,4 +1,6 @@
 #!/bin/sh
-# runit service: install as /etc/sv/openuurd/run and link into /var/service.
+# runit service: install as /etc/sv/openuurd/run and link into the scan
+# directory (for example /var/service or /etc/service).
+# `su` keeps the account's supplementary groups (video/render/audio).
 exec 2>&1
-exec chpst -u alice /etc/openuur/start
+exec su -s /bin/sh -c 'exec /etc/openuurd/start' alice

@@ -214,11 +214,24 @@ fn find_binary(explicit: Option<&Path>) -> Result<PathBuf, String> {
         })
 }
 
-fn default_config(user_home: Option<&Path>) -> Result<PathBuf, String> {
-    match user_home {
-        Some(home) => Ok(home.join(".local/state/openuur/config.toml")),
-        None => crate::config::Config::path().map_err(|error| error.to_string()),
+/// The config file the `openuur login` command would use for this account.
+///
+/// For the invoking account this is exactly `Config::path()`, which honours
+/// `OPENUUR_CONFIG`, `XDG_STATE_HOME` and the legacy config location. For a
+/// different account only its home is known, so mirror the same precedence
+/// without that account's environment.
+fn default_config(uid: u32, home: &Path) -> Result<PathBuf, String> {
+    if uid == unsafe { libc::geteuid() } {
+        if let Ok(path) = crate::config::Config::path() {
+            return Ok(path);
+        }
     }
+    let state = home.join(".local/state/openuur/config.toml");
+    let legacy = home.join(".config/openuur/config.toml");
+    if !state.exists() && legacy.exists() {
+        return Ok(legacy);
+    }
+    Ok(state)
 }
 
 /// Detect the running init from `/proc/1/comm` plus well-known runtime paths.
@@ -230,17 +243,15 @@ fn detect_init_with(comm: &str, exists: &dyn Fn(&Path) -> bool) -> Init {
     if comm.contains("openrc") || exists(Path::new("/run/openrc")) {
         return Init::OpenRC;
     }
-    if comm == "runit"
-        || comm == "runsvdir"
-        || exists(Path::new("/run/runit"))
-        || exists(Path::new("/etc/runit"))
-    {
+    if comm == "runit" || comm == "runsvdir" || exists(Path::new("/run/runit")) {
         return Init::Runit;
     }
-    if comm.starts_with("s6") || exists(Path::new("/run/s6")) || exists(Path::new("/etc/s6")) {
+    if comm.starts_with("s6") || exists(Path::new("/run/s6")) || exists(Path::new("/run/s6-rc")) {
         return Init::S6;
     }
-    if comm == "init" && exists(Path::new("/etc/inittab")) {
+    if (comm == "init" || comm == "sysvinit" || comm == "busybox")
+        && exists(Path::new("/etc/inittab"))
+    {
         return Init::Sysv;
     }
     Init::Xdg
@@ -348,6 +359,8 @@ fn desktop_quote(value: &str) -> String {
                 out.push('\\');
                 out.push(character);
             }
+            // Desktop Entry field codes start with %; a literal % is %%.
+            '%' => out.push_str("%%"),
             _ => out.push(character),
         }
     }
@@ -438,8 +451,8 @@ command=\"{START_SCRIPT}\"\n\
 command_user={}\n\
 command_background=yes\n\
 pidfile=\"/run/${{RC_SVCNAME}}.pid\"\n\
-output_log=\"/var/log/openuurd.log\"\n\
-error_log=\"/var/log/openuurd.log\"\n\
+# Do not set output_log/error_log: start-stop-daemon drops privileges before\n\
+# opening them, so an unprivileged command_user cannot create /var/log files.\n\
 \n\
 depend() {{\n\
     need net\n\
@@ -450,10 +463,13 @@ depend() {{\n\
 }
 
 fn runit_run(user: &str) -> String {
+    // chpst -u drops supplementary groups (unlike systemd/s6-setuidgid);
+    // `su` applies the account's full group list. runsv runs the script in
+    // its own process group, so TERM still reaches the daemon.
     format!(
         "#!/bin/sh\n\
 exec 2>&1\n\
-exec chpst -u {} {START_SCRIPT}\n",
+exec su -s /bin/sh -c 'exec {START_SCRIPT}' {}\n",
         shell_quote(user),
     )
 }
@@ -486,7 +502,7 @@ PIDFILE=/run/openuurd.pid\n\
 case \"$1\" in\n\
     start)\n\
         start-stop-daemon --start --quiet --background --make-pidfile \\\n\
-            --pidfile \"$PIDFILE\" --chuid {} --exec {START_SCRIPT}\n\
+            --pidfile \"$PIDFILE\" --chuid {} --startas {START_SCRIPT}\n\
         ;;\n\
     stop)\n\
         start-stop-daemon --stop --quiet --retry TERM/10/KILL/5 --pidfile \"$PIDFILE\"\n\
@@ -696,8 +712,11 @@ fn enable_service(
             (enabled, started)
         }
         Init::Runit => {
-            let scan = first_existing(layout, &["/run/service", "/var/service", "/service"])
-                .unwrap_or("/var/service");
+            let scan = first_existing(
+                layout,
+                &["/run/service", "/var/service", "/etc/service", "/service"],
+            )
+            .unwrap_or("/var/service");
             let source = layout.system("/etc/sv/openuurd");
             let enabled = match link_service(layout, &source, scan) {
                 Ok(_) => true,
@@ -706,10 +725,26 @@ fn enable_service(
                     false
                 }
             };
+            if enabled && no_start && layout.root == Path::new("/") {
+                warnings.push(
+                    "runit may start openuurd as soon as it is linked into the scan directory"
+                        .to_owned(),
+                );
+            }
+            let svdir = format!("SVDIR={scan}");
             let started = enabled
                 && !no_start
-                && (execute(runner, "sv", &["up", "openuurd"], warnings)
-                    || execute(runner, "sv", &["start", "openuurd"], warnings));
+                && (execute(
+                    runner,
+                    "env",
+                    &[svdir.as_str(), "sv", "up", "openuurd"],
+                    warnings,
+                ) || execute(
+                    runner,
+                    "env",
+                    &[svdir.as_str(), "sv", "start", "openuurd"],
+                    warnings,
+                ));
             (enabled, started)
         }
         Init::S6 => {
@@ -718,10 +753,13 @@ fn enable_service(
                     "s6-rc controls this system: add /etc/s6/sv/openuurd to a source directory and rebuild the database with s6-rc-compile/s6-rc-update"
                         .to_owned(),
                 );
-                return (true, false);
+                return (false, false);
             }
-            let scan = first_existing(layout, &["/run/service", "/var/service", "/service"])
-                .unwrap_or("/var/service");
+            let scan = first_existing(
+                layout,
+                &["/run/service", "/var/service", "/etc/service", "/service"],
+            )
+            .unwrap_or("/var/service");
             let source = layout.system("/etc/s6/sv/openuurd");
             let enabled = match link_service(layout, &source, scan) {
                 Ok(_) => true,
@@ -730,6 +768,12 @@ fn enable_service(
                     false
                 }
             };
+            if enabled && no_start && layout.root == Path::new("/") {
+                warnings.push(
+                    "s6 may start openuurd as soon as the service is linked into the scan directory"
+                        .to_owned(),
+                );
+            }
             let started =
                 enabled && !no_start && execute(runner, "s6-svscanctl", &["-a", scan], warnings);
             (enabled, started)
@@ -762,9 +806,14 @@ fn install_with(
 ) -> Result<InstallReport, String> {
     let binary = find_binary(options.binary.as_deref())?;
     let config_home = target.map(|(_, _, home)| home).unwrap_or(&layout.user_home);
+    let config_uid = target
+        .map(|(_, uid, _)| uid)
+        .unwrap_or_else(|| unsafe { libc::geteuid() });
     let config = match &options.config {
-        Some(path) => path.canonicalize().unwrap_or_else(|_| path.clone()),
-        None => default_config(Some(config_home))?,
+        // A relative path would be resolved against the service's working
+        // directory, not the user's shell.
+        Some(path) => std::path::absolute(path).unwrap_or_else(|_| path.clone()),
+        None => default_config(config_uid, config_home)?,
     };
     if !config.is_file() {
         warnings.push(format!(
@@ -867,6 +916,12 @@ pub fn run(options: InstallOptions) -> Result<InstallReport, String> {
         .init
         .as_deref()
         .is_none_or(|value| value.trim().eq_ignore_ascii_case("auto"));
+    if automatic && init == Init::Xdg && scope == Scope::System {
+        return Err(
+            "cannot determine the init system; pass --init systemd, openrc, runit, s6 or sysv"
+                .to_owned(),
+        );
+    }
     let mut warnings = Vec::new();
     let init = resolve_init(init, scope, automatic, &mut warnings)?;
     let (user, uid, home) = if scope == Scope::System {
@@ -999,9 +1054,9 @@ mod tests {
     fn init_templates_drop_privileges_and_use_the_launcher() {
         assert!(openrc_script("u").contains(&format!("command=\"{START_SCRIPT}\"")));
         assert!(openrc_script("u").contains("command_user='u'"));
-        assert!(runit_run("u").contains(&format!("chpst -u 'u' {START_SCRIPT}")));
+        assert!(runit_run("u").contains(&format!("su -s /bin/sh -c 'exec {START_SCRIPT}' 'u'")));
         assert!(s6_run("u").contains(&format!("s6-setuidgid 'u' {START_SCRIPT}")));
-        assert!(sysv_script("u").contains("--chuid 'u' --exec /etc/openuurd/start"));
+        assert!(sysv_script("u").contains("--chuid 'u' --startas /etc/openuurd/start"));
         assert_eq!(S6_TYPE, "longrun\n");
     }
 
@@ -1034,6 +1089,7 @@ mod tests {
         assert_eq!(escape_arg("/opt/$x/openuurd"), "\"/opt/$$x/openuurd\"");
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
         assert_eq!(desktop_quote("$a `b` \"c\""), "\"\\$a \\`b\\` \\\"c\\\"\"");
+        assert_eq!(desktop_quote("/opt/100%"), "\"/opt/100%%\"");
     }
 
     #[test]
@@ -1082,7 +1138,7 @@ mod tests {
         assert!(
             std::fs::read_to_string(layout.system("/etc/sv/openuurd/run"))
                 .unwrap()
-                .contains("chpst")
+                .contains("su -s /bin/sh")
         );
         assert!(layout.system("/etc/openuurd/start").is_file());
         assert!(root.join("var/service/openuurd").symlink_metadata().is_ok());

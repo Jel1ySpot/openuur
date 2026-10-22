@@ -78,7 +78,7 @@ fn quiet(program: &str, args: &[&str]) -> bool {
 /// commands cover OpenRC, runit, s6 and SysV (where the daemon may be root).
 fn power_action(action: &str) -> bool {
     quiet("systemctl", &["--no-ask-password", action])
-        || quiet("loginctl", &[action])
+        || quiet("loginctl", &["--no-ask-password", action])
         || quiet(action, &[])
 }
 

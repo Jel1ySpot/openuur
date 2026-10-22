@@ -379,8 +379,8 @@ fn remember_connect(
                 )?;
                 if resolved != selection.effective {
                     tracing::warn!(
-                        "native wlroots capture is output-only; \
-                         using xdg-desktop-portal for this source"
+                        "the native backend captures whole outputs; \
+                         using xdg-desktop-portal for this capture source"
                     );
                 }
                 let backend = if resolved == desktop::Backend::Wlroots {
@@ -2099,25 +2099,32 @@ async fn handle_soac(
                 .as_ref()
                 .map(|item| item.controller_mac)
                 .unwrap_or_else(|| crate::desktop::input_map::controller_is_mac(&header, None));
-            let desktop = if matches!(capture_type, 1 | 2) {
+            let mut desktop = if matches!(capture_type, 1 | 2) {
                 let receiver = request.as_mut().and_then(|item| item.desktop.take());
-                let Some(receiver) = receiver else {
-                    tracing::warn!("native UU desktop offer has no capture request");
-                    return;
-                };
-                match tokio::time::timeout(Duration::from_secs(90), receiver).await {
-                    Ok(Ok(Ok(started))) => Some(started),
-                    Ok(Ok(Err(error))) => {
-                        tracing::warn!("native UU desktop capture unavailable: {error}");
+                match receiver {
+                    None => {
+                        // The request was cancelled (for example by a
+                        // session change). Still answer; CONTROL reports the
+                        // failure.
+                        tracing::warn!("native UU desktop offer has no capture request");
                         None
                     }
-                    Ok(Err(_)) => {
-                        tracing::warn!("native UU desktop capture task stopped");
-                        None
-                    }
-                    Err(_) => {
-                        tracing::warn!("native UU desktop capture timed out");
-                        None
+                    Some(receiver) => {
+                        match tokio::time::timeout(Duration::from_secs(90), receiver).await {
+                            Ok(Ok(Ok(started))) => Some(started),
+                            Ok(Ok(Err(error))) => {
+                                tracing::warn!("native UU desktop capture unavailable: {error}");
+                                None
+                            }
+                            Ok(Err(_)) => {
+                                tracing::warn!("native UU desktop capture task stopped");
+                                None
+                            }
+                            Err(_) => {
+                                tracing::warn!("native UU desktop capture timed out");
+                                None
+                            }
+                        }
                     }
                 }
             } else {
@@ -2137,9 +2144,9 @@ async fn handle_soac(
                 {
                     started.desktop.stop();
                     tracing::warn!(
-                        "native UU desktop session changed before the offer; rejecting peer"
+                        "native UU desktop session changed before the offer; answering without video"
                     );
-                    return;
+                    desktop = None;
                 }
             }
             let session = desktop.as_ref().map(|started| started.session.identity());

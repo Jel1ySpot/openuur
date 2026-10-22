@@ -1,11 +1,11 @@
 #!/sbin/openrc-run
 description="openuur UU native host"
-command="/etc/openuur/start"
+command="/etc/openuurd/start"
 command_user=alice
 command_background=yes
 pidfile="/run/${RC_SVCNAME}.pid"
-output_log="/var/log/openuurd.log"
-error_log="/var/log/openuurd.log"
+# Do not set output_log/error_log: start-stop-daemon drops privileges before
+# opening them, so an unprivileged command_user cannot create /var/log files.
 
 depend() {
     need net

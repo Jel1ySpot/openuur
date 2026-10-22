@@ -791,6 +791,10 @@ fn process_env_session() -> Option<SessionEnv> {
     // user's environment; logind is the only trusted source there. This also
     // keeps the greeter out of reach on systems without logind.
     if unsafe { libc::geteuid() == 0 } && std::env::var_os("UU_SESSION_ENV_FALLBACK").is_none() {
+        tracing::info!(
+            "not trusting the process environment for the graphical session as root; \
+             set UU_SESSION_ENV_FALLBACK=1 to override"
+        );
         return None;
     }
     let leader = LeaderEnv::from_process_env();

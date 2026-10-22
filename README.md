@@ -103,14 +103,14 @@ sudo openuur install --init sysv   --scope system --user alice
 # 登录后自动启动的用户级入口（非 systemd init 会回退到 XDG autostart）
 openuur install --init xdg --scope user
 
-# 只写文件，不立即启动
+# 只写入并启用服务，不立即启动（runit/s6 链接后可能由扫描器启动）
 sudo openuur install --init systemd --no-start
 ```
 
 | init | 系统级路径 | 启用/启动 |
 |---|---|---|
 | systemd | `/etc/systemd/system/openuurd.service` | `systemctl daemon-reload && systemctl enable --now openuurd` |
-| OpenRC | `/etc/init.d/openuurd`（共享启动脚本 `/etc/openuur/start`） | `rc-update add openuurd default && rc-service openuurd start` |
+| OpenRC | `/etc/init.d/openuurd`（共享启动脚本 `/etc/openuurd/start`） | `rc-update add openuurd default && rc-service openuurd start` |
 | runit | `/etc/sv/openuurd/run` + `/var/service/openuurd` 链接 | `sv up openuurd` |
 | s6 | `/etc/s6/sv/openuurd/{run,type}` | 链接到扫描目录后 `s6-svscanctl -a /run/service`；s6-rc 系统需重建数据库 |
 | SysV | `/etc/init.d/openuurd` | `update-rc.d openuurd defaults && service openuurd start` |
@@ -128,9 +128,10 @@ systemctl --user daemon-reload
 systemctl --user enable --now openuurd
 
 # OpenRC（系统）
+sudo mkdir -p /etc/openuurd
 sudo cp contrib/templates/openuurd.openrc /etc/init.d/openuurd
-sudo cp contrib/templates/openuurd.start /etc/openuur/start   # 按需修改路径/账号
-sudo chmod 755 /etc/init.d/openuurd /etc/openuur/start
+sudo cp contrib/templates/openuurd.start /etc/openuurd/start   # 按需修改路径/账号
+sudo chmod 755 /etc/init.d/openuurd /etc/openuurd/start
 sudo rc-update add openuurd default && sudo rc-service openuurd start
 ```
 
@@ -197,7 +198,7 @@ openuurd run
 openuurd run --password 'your-password'
 ```
 
-远程桌面要求 `openuurd` 能找到该账号**已登录的图形会话**：Wayland 会话通过 xdg-desktop-portal（首次连接会弹出屏幕共享 + 远程输入授权；系统服务会通过 logind 投影 `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`/session bus），X11 会话直接使用 XDamage/XTest（不需要 portal）。在没有图形会话的 greeter 阶段仍只提供终端。
+远程桌面要求 `openuurd` 能找到该账号**已登录的图形会话**：Wayland 会话通过 xdg-desktop-portal（首次连接会弹出屏幕共享 + 远程输入授权；系统服务会通过 logind 投影 `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`/session bus），X11 会话直接使用 XDamage/XTest（不需要 portal）。在没有图形会话的 greeter 阶段仍提供终端、文件传输与端口映射，但不会采集 greeter 桌面；登录后桌面自动接入。
 
 `--no-online` 只生成/显示本地设备身份，不连接 UU 信令：
 
@@ -236,7 +237,7 @@ openuur.override { ffmpeg = pkgs.ffmpeg-full; }
     user = "alice";                 # 必须拥有活动的图形会话
     displaySource = "monitor";      # monitor | window | virtual
     desktopBackend = "auto";        # auto | portal | x11 | wlroots
-    preventSleep = true;            # 有远端桌面连接时阻止系统休眠/空闲
+    preventSleep = true;            # 有任意远端会话时阻止系统休眠/空闲
     extraGroups = [ "video" "render" "audio" ];
     fileSavePath = "/home/alice/Downloads";
 
@@ -262,7 +263,7 @@ openuur.override { ffmpeg = pkgs.ffmpeg-full; }
 - `settings` 不要放 `token`。可用该账号执行 `openuur --config ~/.local/state/openuur/config.toml login --qr` 登录/注册。也可以直接用 `configFile` 指向 secret 管理的可写配置；如果该文件只读，需已包含注册后的 `device_id` 和 `device_registered = true`。
 - 服务默认读取目标账号的 `~/.local/state/openuur/config.toml`；先以该账号执行 `openuur login --qr`。旧的 `~/.config/openuur/config.toml` 在状态目录没有配置时仍会继续使用。
 - 系统服务在开机时启动，不写死 `WAYLAND_DISPLAY` 或 `XDG_SESSION_TYPE`；`openuurd` 通过 logind 在运行时发现目标账号的图形会话，登录后自动接入桌面，显示管理器阶段不采集 greeter。
-- `desktopBackend` 写入 `desktop_backend`；`preventSleep = false` 写入 `UU_PREVENT_SLEEP=0`。
+- `desktopBackend` 通过 `UU_DESKTOP_BACKEND` 传给服务（配置文件中显式的 `desktop_backend` 优先）；`preventSleep = false` 写入 `UU_PREVENT_SLEEP=0`。
 - `services.openuur.ffmpegPackage` 可选择 `pkgs.ffmpeg-full` 以获得更多硬件编码器。
 
 ### Home Manager 模块
@@ -337,7 +338,7 @@ target/release/openuurd
 | wlroots 后端 | 直接使用 `zwlr_screencopy_manager_v1`（wl_shm 双缓冲、Y_INVERT/XBGR/ABGR 转换）、`zwlr_virtual_pointer_v1`、`zwp_virtual_keyboard_v1`（xkbcommon keymap、修饰键计数、Caps/Num Lock、文本临时 keycode）与 `zwlr_output_power_manager_v1` 唤醒；多显示器绝对坐标使用 `zxdg_output_v1` 逻辑布局（wl_output.geometry 在 wlroots 恒为 0）；锁屏/挂起时立即停帧并释放输入，长文本粘贴也会中止；不支持窗口/虚拟源与光标形状，旋转输出以合成器返回的缓冲区尺寸为准 |
 | X11 后端 | XDamage + MIT-SHM 采集（缺 DAMAGE/SHM 时退化轮询或 `GetImage`）、XTest 绝对/相对指针与按键、120 单位滚轮、临时 keycode 文本输入、XFixes 光标形状同步（serial 去重、≤30 Hz、PNG）、RandR 活动显示器切换；窗口/虚拟源仍请使用 portal；X11 会话暂不支持文本剪贴板 |
 | 快捷键映射 | macOS 控制端的 Cmd+C/V/A/F/X/Z 映射为 Ctrl（聚焦终端内 Cmd+C/V 为 Ctrl+Shift），其余 Cmd 组合与单独 Cmd 保持 Super；X11 终端内 Ctrl+V 自动变为 Ctrl+Shift+V；`UU_MAC_SHORTCUTS=0\|1` 强制控制端类型，`UU_TERMINAL_SHORTCUTS=0` 关闭终端转换 |
-| 会话发现 | 系统服务通过 logind 找到账号的活动图形会话，投影 `WAYLAND_DISPLAY`/`DISPLAY`/`XDG_RUNTIME_DIR`/session bus 等 7 个变量；每 2 秒复查，会话切换只断开桌面 peer，终端/文件/端口映射保留；没有会话时明确报「等待图形会话」 |
+| 会话发现 | 系统服务通过 logind 找到账号的活动图形会话，投影 `WAYLAND_DISPLAY`/`DISPLAY`/`XDG_RUNTIME_DIR`/session bus 等 7 个变量；每 2 秒复查，会话切换只断开桌面 peer，终端/文件/端口映射保留；没有会话时明确报「等待图形会话」。没有 logind 时仅在非 root 进程中使用经过 socket 校验的进程环境兜底；root 进程需显式设置 `UU_SESSION_ENV_FALLBACK=1` |
 | 显示源 | `openuurd display source monitor\|window\|virtual`，或 `openuurd run --display-source ...` / `UU_DISPLAY_SOURCE` |
 | 分辨率 | 编码器缩放，不修改宿主机显示模式；显示配置变化时重建采集并保留编码尺寸 |
 | H.264/H.265 | `UU_VIDEO_CODEC=h264\|h265`；默认跟随官方协商 |

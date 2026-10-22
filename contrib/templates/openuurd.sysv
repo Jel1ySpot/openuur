@@ -13,7 +13,7 @@ PIDFILE=/run/openuurd.pid
 case "$1" in
     start)
         start-stop-daemon --start --quiet --background --make-pidfile \
-            --pidfile "$PIDFILE" --chuid alice --exec /etc/openuur/start
+            --pidfile "$PIDFILE" --chuid alice --startas /etc/openuurd/start
         ;;
     stop)
         start-stop-daemon --stop --quiet --retry TERM/10/KILL/5 --pidfile "$PIDFILE"
