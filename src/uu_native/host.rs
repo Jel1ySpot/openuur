@@ -1428,6 +1428,49 @@ fn install_host_channels(
                                 }
                             }
                         });
+                        // Cursor shapes: publish the current shape when the
+                        // channel opens, then each change at most 30 times a
+                        // second. Backends without a global cursor (portal)
+                        // never produce an image, so this task stays idle.
+                        let mut cursor = desktop.cursor();
+                        let cursor_channel = ready_channel.clone();
+                        let cursor_sequence = ready_sequence.clone();
+                        tokio::spawn(async move {
+                            let mut sent_serial = None;
+                            loop {
+                                if cursor_channel.ready_state()
+                                    != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
+                                {
+                                    break;
+                                }
+                                let image = cursor.borrow_and_update().clone();
+                                if let Some(image) = image {
+                                    if sent_serial != Some(image.serial) {
+                                        if let Some(body) = initialization::cursor_shape(&image) {
+                                            if !send_framed(
+                                                &cursor_channel,
+                                                &cursor_sequence,
+                                                15,
+                                                &body,
+                                            )
+                                            .await
+                                            {
+                                                break;
+                                            }
+                                            sent_serial = Some(image.serial);
+                                            tokio::time::sleep(Duration::from_millis(33)).await;
+                                            continue;
+                                        }
+                                    }
+                                }
+                                tokio::select! {
+                                    changed = cursor.changed() => {
+                                        if changed.is_err() { break; }
+                                    }
+                                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                                }
+                            }
+                        });
                         let _ = ready_clipboard;
                     })
                 }));
@@ -1513,7 +1556,8 @@ fn install_host_channels(
 
                         if let Some(desktop) = &desktop {
                             if let Ok(value) = serde_json::from_slice::<Value>(&data) {
-                                let locked = *lock_watch.borrow() != Some(false);
+                                let locked =
+                                    crate::desktop::session_lock::effective_locked(*lock_watch.borrow());
                                 if !locked && handle_desktop_input(desktop.input(), &value) {
                                     crate::desktop::clipboard::mark_focus();
                                     return;

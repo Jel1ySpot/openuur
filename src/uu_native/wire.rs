@@ -37,6 +37,12 @@ pub fn bytes(number: u32, value: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(value);
 }
 
+/// A `fixed64` field, used by protobuf `double`.
+pub fn fixed64(number: u32, value: u64, out: &mut Vec<u8>) {
+    put_varint((u64::from(number) << 3) | 1, out);
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
 pub fn decode(mut data: &[u8]) -> Option<Vec<Field>> {
     let mut fields = Vec::new();
     while !data.is_empty() {
@@ -261,6 +267,15 @@ mod tests {
         let fields = decode(&outer).unwrap();
         let nested = decode(blob(&fields, 21).unwrap()).unwrap();
         assert_eq!(uint(&nested, 1), Some(7));
+    }
+
+    #[test]
+    fn fixed64_encodes_double_bits_little_endian() {
+        let mut out = Vec::new();
+        fixed64(7, 1.0f64.to_bits(), &mut out);
+        let fields = decode(&out).unwrap();
+        assert_eq!(fields[0].number, 7);
+        assert_eq!(fields[0].value, Value::Fixed64(1.0f64.to_le_bytes()));
     }
 }
 

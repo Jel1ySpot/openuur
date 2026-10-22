@@ -340,6 +340,35 @@ pub fn permissions(
     change
 }
 
+/// `Message.system_state_change` (field 15) with a CursorShape.
+///
+/// `pos_x`/`pos_y` are the hotspot, field 5 is a straight-alpha RGBA PNG, and
+/// both coordinate scales are 1.0 (video pixels per screen point). The
+/// zero-valued `cursor_type` and `screen_id` are omitted as proto3 defaults.
+pub fn cursor_shape(cursor: &crate::desktop::CursorImage) -> Option<Vec<u8>> {
+    let rgba = crate::desktop::cursor::rgba_from_argb(&cursor.argb);
+    let png =
+        crate::desktop::cursor::png_rgba8(u32::from(cursor.width), u32::from(cursor.height), &rgba);
+    if png.is_empty() {
+        return None;
+    }
+    let mut shape = Vec::new();
+    if cursor.xhot != 0 {
+        wire::int(1, u64::from(cursor.xhot), &mut shape);
+    }
+    if cursor.yhot != 0 {
+        wire::int(2, u64::from(cursor.yhot), &mut shape);
+    }
+    wire::int(3, u64::from(cursor.width), &mut shape);
+    wire::int(4, u64::from(cursor.height), &mut shape);
+    wire::bytes(5, &png, &mut shape);
+    wire::fixed64(7, 1.0f64.to_bits(), &mut shape);
+    wire::fixed64(8, 1.0f64.to_bits(), &mut shape);
+    let mut change = Vec::new();
+    wire::bytes(2, &shape, &mut change);
+    Some(change)
+}
+
 /// `SimpleAction` echo response body (field 3 content).
 pub fn echo_response_body(
     request_seq: u64,
@@ -486,6 +515,40 @@ mod tests {
         assert_eq!(wire::uint(&state, 2), Some(1));
         assert_eq!(wire::uint(&state, 4), Some(1));
         assert_eq!(wire::uint(&state, 1), None);
+    }
+
+    #[test]
+    fn cursor_shape_carries_hotspot_size_and_png() {
+        let cursor = crate::desktop::CursorImage {
+            serial: 7,
+            width: 2,
+            height: 1,
+            xhot: 1,
+            yhot: 0,
+            argb: std::sync::Arc::new(vec![0x80_8000_00, 0xff00_ff00]),
+        };
+        let change = decode(&cursor_shape(&cursor).unwrap());
+        let shape = wire::decode(wire::blob(&change, 2).unwrap()).unwrap();
+        assert_eq!(wire::uint(&shape, 1), Some(1));
+        assert_eq!(wire::uint(&shape, 2), None);
+        assert_eq!(wire::uint(&shape, 3), Some(2));
+        assert_eq!(wire::uint(&shape, 4), Some(1));
+        let png = wire::blob(&shape, 5).unwrap();
+        assert_eq!(&png[..8], &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+        for field in [7u32, 8] {
+            assert!(shape.iter().any(|item| item.number == field
+                && item.value == wire::Value::Fixed64(1.0f64.to_le_bytes())));
+        }
+        // An empty image produces no message at all.
+        let empty = crate::desktop::CursorImage {
+            serial: 8,
+            width: 0,
+            height: 0,
+            xhot: 0,
+            yhot: 0,
+            argb: std::sync::Arc::new(Vec::new()),
+        };
+        assert!(cursor_shape(&empty).is_none());
     }
 
     #[test]
