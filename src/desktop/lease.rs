@@ -72,6 +72,7 @@ impl InputLease {
         {
             // A reconnect must not inherit the previous connection's holds.
             self.sink.reset();
+            tracing::info!("desktop input lease activated");
         }
     }
 
@@ -84,6 +85,7 @@ impl InputLease {
             && self.active.swap(false, Ordering::AcqRel)
         {
             self.sink.reset();
+            tracing::info!("desktop input lease paused");
         }
     }
 
@@ -109,11 +111,24 @@ impl InputLease {
         let owner = OWNER
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if owner.as_ref().is_some_and(|owner| owner.id == self.id)
-            && self.active.load(Ordering::Acquire)
-        {
-            action(self.sink.as_ref());
+        let Some(owner) = owner.as_ref() else {
+            return;
+        };
+        if owner.id != self.id {
+            static STALE_LOGS: AtomicU64 = AtomicU64::new(0);
+            if STALE_LOGS.fetch_add(1, Ordering::Relaxed) < 12 {
+                tracing::warn!("input dropped: peer is no longer the desktop owner");
+            }
+            return;
         }
+        if !self.active.load(Ordering::Acquire) {
+            static INACTIVE_LOGS: AtomicU64 = AtomicU64::new(0);
+            if INACTIVE_LOGS.fetch_add(1, Ordering::Relaxed) < 12 {
+                tracing::warn!("input dropped: desktop peer is not active yet");
+            }
+            return;
+        }
+        action(self.sink.as_ref());
     }
 }
 

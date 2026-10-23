@@ -187,6 +187,25 @@ pub async fn run(mut config: Config, password: Option<String>) -> Result<()> {
         outbox: Outbox::new(),
         desktop_cache: None,
     };
+    // Portal sessions can only suppress their consent prompt reliably by
+    // staying alive. Request permission now, before any viewer connects, and
+    // keep the capture in the runtime cache for every later offer.
+    match startup_portal(&config).await {
+        Ok(Some(started)) => {
+            tracing::info!(
+                "portal capture started at service startup; its permission stays active"
+            );
+            runtime.desktop_cache = Some(CachedDesktop {
+                desktop: started.desktop,
+                session: started.session,
+                source: started.source,
+            });
+        }
+        Ok(None) => {
+            tracing::debug!("portal capture not started: the selected backend is not portal")
+        }
+        Err(error) => tracing::warn!("portal startup permission request failed: {error}"),
+    }
     let mut backoff = Duration::from_secs(3);
     let mut expired_logged = false;
     // Registered once for the whole process: during reconnect backoff and
@@ -451,6 +470,104 @@ async fn maintain(runtime: &mut HostRuntime) {
     }
 }
 
+/// Resolve the final backend, including the native wlroots capability probe.
+async fn resolve_desktop_backend(
+    choice: desktop::BackendChoice,
+    session: &session_env::SessionEnv,
+    source: desktop::SourceKind,
+) -> std::result::Result<desktop::Backend, String> {
+    // The monitor is the sole writer of the projected environment; re-applying
+    // here could revert a newer session it just applied.
+    let selection = desktop::effective_selection(choice, session);
+    // Auto keeps non-GNOME/KDE Wayland sessions working through the portal
+    // when the compositor lacks the wlr protocols; an explicit wlroots request
+    // fails instead.
+    let resolved =
+        desktop::backend_for_source(selection, source, choice == desktop::BackendChoice::Auto)?;
+    if resolved != selection.effective {
+        tracing::warn!(
+            "the native backend captures whole outputs; \
+             using xdg-desktop-portal for this capture source"
+        );
+    }
+    if resolved != desktop::Backend::Wlroots {
+        return Ok(resolved);
+    }
+    match tokio::task::spawn_blocking(desktop::probe_wlroots).await {
+        Ok(Ok(())) => Ok(desktop::Backend::Wlroots),
+        Ok(Err(error)) if choice == desktop::BackendChoice::Auto => {
+            tracing::warn!(
+                "native wlroots capture unavailable ({error}); \
+                 using xdg-desktop-portal"
+            );
+            Ok(desktop::Backend::Wayland)
+        }
+        Ok(Err(error)) => Err(format!("wlroots backend unavailable: {error}")),
+        Err(error) => Err(format!("wlroots capability probe failed: {error}")),
+    }
+}
+
+/// Start a capture and pin it to the session that was resolved for it.
+async fn open_desktop_session(
+    backend: desktop::Backend,
+    options: DesktopOptions,
+    session: session_env::SessionEnv,
+) -> std::result::Result<StartedDesktop, String> {
+    let source = options.source;
+    let desktop = desktop::start_with(backend, options).await.map(Arc::new)?;
+    // A session change while the portal was starting must not attach a stale
+    // capture to a later offer.
+    if session_env::current().map(|env| env.identity()) != Some(session.identity()) {
+        desktop.stop();
+        return Err("graphical session changed during capture startup".to_owned());
+    }
+    Ok(StartedDesktop {
+        desktop,
+        session,
+        source,
+    })
+}
+
+/// Open the capture for one connection request.
+async fn start_requested_desktop(
+    options: DesktopOptions,
+    choice: desktop::BackendChoice,
+) -> std::result::Result<StartedDesktop, String> {
+    let session = session_env::wait_for_session(session_env::SESSION_WAIT).await?;
+    let backend = resolve_desktop_backend(choice, &session, options.source).await?;
+    open_desktop_session(backend, options, session).await
+}
+
+/// Request portal permission as soon as the service starts, before the first
+/// viewer connects. The returned capture is retained by the host runtime and
+/// reused for every later offer.
+async fn startup_portal(config: &Config) -> std::result::Result<Option<StartedDesktop>, String> {
+    if !desktop::Backend::Wayland.implemented() {
+        return Ok(None);
+    }
+    let source = config.display_source();
+    let choice = config.desktop_backend();
+    let session = match session_env::wait_for_session(session_env::SESSION_WAIT).await {
+        Ok(session) => session,
+        Err(error) => {
+            tracing::info!("portal permission request deferred: {error}");
+            return Ok(None);
+        }
+    };
+    if resolve_desktop_backend(choice, &session, source).await? != desktop::Backend::Wayland {
+        return Ok(None);
+    }
+    let key = desktop::portal_permissions::key(source.as_str());
+    let options = DesktopOptions {
+        restore_token: desktop::portal_permissions::restore_token(&key),
+        source,
+        clipboard: true,
+    };
+    open_desktop_session(desktop::Backend::Wayland, options, session)
+        .await
+        .map(Some)
+}
+
 fn remember_connect(
     runtime: &mut HostRuntime,
     data: Value,
@@ -530,65 +647,7 @@ fn remember_connect(
                 };
                 let choice = config.desktop_backend();
                 tokio::spawn(async move {
-                    let result = async {
-                        let session =
-                            session_env::wait_for_session(session_env::SESSION_WAIT).await?;
-                        // The monitor is the sole writer of the projected
-                        // environment; re-applying here could revert a newer
-                        // session it just applied.
-                        let selection = desktop::effective_selection(choice, &session);
-                        // Auto keeps non-GNOME/KDE Wayland sessions working
-                        // through the portal when the compositor lacks the
-                        // wlr protocols; an explicit wlroots request fails.
-                        let resolved = desktop::backend_for_source(
-                            selection,
-                            options.source,
-                            choice == desktop::BackendChoice::Auto,
-                        )?;
-                        if resolved != selection.effective {
-                            tracing::warn!(
-                                "the native backend captures whole outputs; \
-                                 using xdg-desktop-portal for this capture source"
-                            );
-                        }
-                        let backend = if resolved == desktop::Backend::Wlroots {
-                            match tokio::task::spawn_blocking(desktop::probe_wlroots).await {
-                                Ok(Ok(())) => desktop::Backend::Wlroots,
-                                Ok(Err(error)) if choice == desktop::BackendChoice::Auto => {
-                                    tracing::warn!(
-                                        "native wlroots capture unavailable ({error}); \
-                                         using xdg-desktop-portal"
-                                    );
-                                    desktop::Backend::Wayland
-                                }
-                                Ok(Err(error)) => {
-                                    return Err(format!("wlroots backend unavailable: {error}"))
-                                }
-                                Err(error) => {
-                                    return Err(format!("wlroots capability probe failed: {error}"))
-                                }
-                            }
-                        } else {
-                            resolved
-                        };
-                        let desktop = desktop::start_with(backend, options).await.map(Arc::new)?;
-                        // A session change while the portal was starting must
-                        // not attach a stale capture to a later offer.
-                        if session_env::current().map(|env| env.identity())
-                            != Some(session.identity())
-                        {
-                            desktop.stop();
-                            return Err(
-                                "graphical session changed during capture startup".to_owned()
-                            );
-                        }
-                        Ok(StartedDesktop {
-                            desktop,
-                            session,
-                            source,
-                        })
-                    }
-                    .await;
+                    let result = start_requested_desktop(options, choice).await;
                     let _ = tx.send(result);
                 });
                 Some(PendingDesktop::Starting(rx))
@@ -1274,8 +1333,11 @@ fn install_host_channels(
     // Every desktop peer maps controller shortcuts in front of the backend.
     // The lease makes the newest desktop peer the only one that can inject:
     // a delayed event from a replaced peer is dropped, including its releases.
-    let mapped_input: Option<Arc<dyn crate::desktop::InputSink>> =
-        desktop.as_ref().map(|desktop| {
+    let (mapped_input, input_lease): (
+        Option<Arc<dyn crate::desktop::InputSink>>,
+        Option<Arc<crate::desktop::lease::InputLease>>,
+    ) = match desktop.as_ref() {
+        Some(desktop) => {
             let lease = crate::desktop::lease::InputLease::claim(desktop.input());
             {
                 let lease = lease.clone();
@@ -1301,16 +1363,19 @@ fn install_host_channels(
                 });
             }
             let input: Arc<dyn crate::desktop::InputSink> =
-                Arc::new(crate::desktop::lease::LeasedInput::new(lease));
-            Arc::new(
+                Arc::new(crate::desktop::lease::LeasedInput::new(lease.clone()));
+            let mapped = Arc::new(
                 crate::desktop::input_map::MappedInput::new(
                     input,
                     controller_mac,
                     desktop.backend == crate::desktop::Backend::X11,
                 )
                 .with_lock(crate::desktop::session_lock::watch_locked()),
-            ) as Arc<dyn crate::desktop::InputSink>
-        });
+            ) as Arc<dyn crate::desktop::InputSink>;
+            (Some(mapped), Some(lease))
+        }
+        None => (None, None),
+    };
     let clipboard_ready = Arc::new(AtomicBool::new(false));
     let sound = crate::desktop::audio::enabled();
     let save_path = config.file_save_path();
@@ -1444,6 +1509,7 @@ fn install_host_channels(
         let control_channel = control_channel.clone();
         let text_channel = text_channel.clone();
         let mapped_input = mapped_input.clone();
+        let input_lease = input_lease.clone();
         Box::pin(async move {
             tracing::info!("native UU data channel opened: {label}");
 
@@ -1582,6 +1648,7 @@ fn install_host_channels(
                 let ready_clipboard = clipboard_ready.clone();
                 let ready_location = save_location.clone();
                 let ready_label = label.clone();
+                let ready_lease = input_lease.clone();
                 channel.on_open(Box::new(move || {
                     let ready_channel = ready_channel.clone();
                     let ready_desktop = ready_desktop.clone();
@@ -1591,10 +1658,16 @@ fn install_host_channels(
                     let ready_clipboard = ready_clipboard.clone();
                     let ready_location = ready_location.clone();
                     let ready_label = ready_label.clone();
+                    let ready_lease = ready_lease.clone();
                     Box::pin(async move {
                         tracing::info!("native UU data channel ready: {ready_label}");
                         if ready_label != "CONTROL_DATA_CHANNEL" {
                             return;
+                        }
+                        // The channel is open and has been accepted by SCTP;
+                        // do not make input wait for the next state poll.
+                        if let Some(lease) = &ready_lease {
+                            lease.activate();
                         }
                         let Some(desktop) = &ready_desktop else {
                             // A desktop offer whose portal capture failed still
@@ -1630,6 +1703,41 @@ fn install_host_channels(
                             }
                             return;
                         };
+                        // The official client enables remote control only
+                        // after it has seen the active capture target and the
+                        // control permission. Send the same order the reference
+                        // host uses: CaptureChange, metrics, download path,
+                        // codec list, then screen inventory.
+                        if let Some(body) =
+                            initialization::capture_change(capture_change_type, 0, "Linux desktop")
+                        {
+                            send_framed(&ready_channel, &ready_sequence, 8, &body).await;
+                        }
+                        let payload = ready_actions.metrics_payload(
+                            sound,
+                            Permission::Allow,
+                            Permission::Allow,
+                            Permission::Allow,
+                            &ready_location,
+                        );
+                        send_framed(&ready_channel, &ready_sequence, 13, &payload).await;
+                        let download_path =
+                            crate::uu_native::system_metrics::remote_download_path(&ready_location);
+                        send_framed(&ready_channel, &ready_sequence, 26, &download_path).await;
+                        let (width, height) = desktop.active_size();
+                        let (h264, h265) = ready_video
+                            .as_ref()
+                            .map(|track| track.available())
+                            .unwrap_or((true, false));
+                        let h265 = h265 && crate::desktop::encoder::hevc_available();
+                        let codecs = crate::uu_native::video_settings::codec_negotiation(
+                            width,
+                            height,
+                            advertised_fps,
+                            h265,
+                        );
+                        send_framed(&ready_channel, &ready_sequence, 18, &codecs).await;
+                        let _ = h264;
                         let screens = desktop.screens();
                         let active = desktop.screen();
                         if let Some(body) = initialization::screen_sources_from(
@@ -1642,27 +1750,6 @@ fn install_host_channels(
                         ) {
                             send_framed(&ready_channel, &ready_sequence, 7, &body).await;
                         }
-                        if let Some(body) =
-                            initialization::capture_change(capture_change_type, 0, "Linux desktop")
-                        {
-                            send_framed(&ready_channel, &ready_sequence, 8, &body).await;
-                        }
-                        let (width, height) = desktop.active_size();
-                        let (h264, h265) = ready_video
-                            .as_ref()
-                            .map(|track| track.available())
-                            .unwrap_or((true, false));
-                        let h265 = h265
-                            && crate::desktop::encoder::hevc_available();
-                        let codecs =
-                            crate::uu_native::video_settings::codec_negotiation(
-                                width,
-                                height,
-                                advertised_fps,
-                                h265,
-                            );
-                        send_framed(&ready_channel, &ready_sequence, 18, &codecs).await;
-                        let _ = h264;
                         let permissions =
                             initialization::permissions(false, true, true, sound, false);
                         send_framed(&ready_channel, &ready_sequence, 15, &permissions).await;
@@ -1675,17 +1762,6 @@ fn install_host_channels(
                             crate::desktop::session_lock::supported(),
                         );
                         send_framed(&ready_channel, &ready_sequence, 15, &state).await;
-                        let payload = ready_actions.metrics_payload(
-                            sound,
-                            Permission::Allow,
-                            Permission::Allow,
-                            Permission::Allow,
-                            &ready_location,
-                        );
-                        send_framed(&ready_channel, &ready_sequence, 13, &payload).await;
-                        let download_path =
-                            crate::uu_native::system_metrics::remote_download_path(&ready_location);
-                        send_framed(&ready_channel, &ready_sequence, 26, &download_path).await;
 
                         // Report every lock transition on this CONTROL channel.
                         let watch = crate::desktop::session_lock::watch_locked();
@@ -1805,6 +1881,17 @@ fn install_host_channels(
                     let lock_watch = crate::desktop::session_lock::watch_locked();
                     Box::pin(async move {
                         let data = message.data.to_vec();
+                        if label == "CONTROL_DATA_CHANNEL" {
+                            static CONTROL_MESSAGES: AtomicU64 = AtomicU64::new(0);
+                            if CONTROL_MESSAGES.fetch_add(1, Ordering::Relaxed) < 16 {
+                                let json = serde_json::from_slice::<Value>(&data).is_ok();
+                                tracing::info!(
+                                    "native UU CONTROL message bytes={} json={json} wire={}",
+                                    data.len(),
+                                    wire::decode(&data).is_some()
+                                );
+                            }
+                        }
                         if label.contains("STREAMER") {
                             // The official viewer probes this telemetry channel
                             // with JSON pings. Answer immediately; never feed
@@ -1815,6 +1902,55 @@ fn install_host_channels(
                                     .await;
                             }
                             return;
+                        }
+                        // Input is JSON. Handle it before file-transfer and
+                        // port-mapping decoders so a malformed or future RPC
+                        // cannot consume a mouse/keyboard event.
+                        if let Some(input) = &mapped_input {
+                            if let Ok(value) = serde_json::from_slice::<Value>(&data) {
+                                let action = value
+                                    .get("action")
+                                    .and_then(Value::as_str)
+                                    .filter(|action| {
+                                        action.len() <= 40
+                                            && action.bytes().all(|byte| {
+                                                byte.is_ascii_alphanumeric() || byte == b'_'
+                                            })
+                                    });
+                                if let Some(action) = action {
+                                    static INPUT_EVENTS: AtomicU64 = AtomicU64::new(0);
+                                    if INPUT_EVENTS.fetch_add(1, Ordering::Relaxed) < 24 {
+                                        tracing::info!(
+                                            "native UU input action={action} channel={label}"
+                                        );
+                                    }
+                                }
+                                let locked = crate::desktop::session_lock::effective_locked(
+                                    *lock_watch.borrow(),
+                                );
+                                let handled =
+                                    !locked && handle_desktop_input(input.clone(), &value);
+                                if handled {
+                                    crate::desktop::clipboard::mark_focus();
+                                    return;
+                                }
+                                if locked {
+                                    // Releases sent while the session was
+                                    // locking never reached the mapping layer;
+                                    // clear translated state before unlock.
+                                    input.reset();
+                                    if action.is_some() {
+                                        return;
+                                    }
+                                } else if let Some(action) = action {
+                                    static INPUT_DROPS: AtomicU64 = AtomicU64::new(0);
+                                    if INPUT_DROPS.fetch_add(1, Ordering::Relaxed) < 12 {
+                                        tracing::warn!(
+                                            "native UU input action={action} was not injectable"
+                                        );
+                                    }
+                                }
+                            }
                         }
                         if port_mapping.handle(&data, &label).await {
                             return;
@@ -1854,26 +1990,6 @@ fn install_host_channels(
                                         if let Some(text) = result {
                                             incoming.send_replace(Some(text));
                                         }
-                                    }
-                                }
-                            }
-                        }
-
-                        if let Some(input) = &mapped_input {
-                            if let Ok(value) = serde_json::from_slice::<Value>(&data) {
-                                let locked =
-                                    crate::desktop::session_lock::effective_locked(*lock_watch.borrow());
-                                if !locked && handle_desktop_input(input.clone(), &value) {
-                                    crate::desktop::clipboard::mark_focus();
-                                    return;
-                                }
-                                if locked {
-                                    // Releases sent while the session was
-                                    // locking never reached the mapping layer;
-                                    // clear translated state before unlock.
-                                    input.reset();
-                                    if value.get("action").is_some() {
-                                        return;
                                     }
                                 }
                             }

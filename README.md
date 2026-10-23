@@ -167,7 +167,7 @@ openuurd doctor
 
 ### 5. 连接
 
-在另一台设备的官方 UU 客户端中选择该设备并打开「远程桌面」。首次连接 portal 后端仍需要在图形会话中确认屏幕共享/远程输入授权；同一图形会话内断开后重连会复用该授权会话，不再重复确认。
+在另一台设备的官方 UU 客户端中选择该设备并打开「远程桌面」。portal 后端会在 `openuurd` 服务启动时立即申请屏幕共享/远程输入授权，并在服务运行期间保持该会话；后续连接直接复用，不再重复确认。若服务启动时还没有活动的图形会话，则会在首次桌面连接时申请。
 
 > 提示：系统服务适合需要开机自启且账号会话稳定的机器。没有活动图形会话时，`openuurd` 仍提供终端/文件/端口映射，远程桌面会在登录后恢复；桌面请求在登录前会快速失败。推荐优先使用系统级服务以获得开机可用性。
 
@@ -214,7 +214,7 @@ openuurd run
 openuurd run --password 'your-password'
 ```
 
-远程桌面要求 `openuurd` 能找到该账号**已登录的图形会话**：Wayland 会话通过 xdg-desktop-portal（首次连接会弹出屏幕共享 + 远程输入授权，之后的连接复用同一会话；系统服务会通过 logind 投影 `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`/session bus），X11 会话直接使用 XDamage/XTest（不需要 portal）。在没有图形会话的 greeter 阶段仍提供终端、文件传输与端口映射，但不会采集 greeter 桌面；登录后桌面自动接入。
+远程桌面要求 `openuurd` 能找到该账号**已登录的图形会话**：Wayland 会话通过 xdg-desktop-portal（`openuurd` 启动时就会申请屏幕共享 + 远程输入授权，并在运行期间保持；之后的连接复用该会话；系统服务会通过 logind 投影 `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`/session bus），X11 会话直接使用 XDamage/XTest（不需要 portal）。在没有图形会话的 greeter 阶段仍提供终端、文件传输与端口映射，但不会采集 greeter 桌面；登录后桌面自动接入。
 
 `--no-online` 只生成/显示本地设备身份，不连接 UU 信令：
 
@@ -353,7 +353,7 @@ target/release/openuurd
 | 采集后端 | `openuurd run --desktop-backend auto\|portal\|wlroots\|x11`、`UU_DESKTOP_BACKEND`；auto 按会话类型选择（GNOME/KDE Wayland → portal，其它 Wayland → wlroots，X11 → x11）。wlroots 不可用（例如脚本自启动的合成器未暴露 wlr 协议）时，auto 回退 portal 并记录日志；显式 `wlroots` 则直接报错 |
 | portal 输入 | 优先 `ConnectToEIS`/libei，按流的 `mapping_id` 匹配区域，缩放、旋转和多显示器下绝对坐标仍准确；portal 不支持 EIS 或缺少 `mapping_id` 时回退 `Notify*`。可见 `/dev/uinput` 时默认改用内核虚拟键鼠 |
 | portal 拒绝 | 用户拒绝/取消（4）、授权超时（5）、缺少显示器或键鼠权限（6）、帧格式/尺寸不可用（8）、尺寸变化需重连（14）视为终止，不再反复重开授权框；其它错误按退避重试 |
-| portal 会话复用 | 首次授权后保留 portal 采集会话；控制端断开重连时直接复用，不再重复弹出屏幕共享/远程输入确认（compositor 未返回 restore token 时同样生效）；图形会话切换或进程退出时释放 |
+| portal 会话复用 | `openuurd` 启动时即申请 portal 屏幕共享/远程输入授权并保持采集会话；控制端断开重连直接复用，不再重复确认（compositor 未返回 restore token 时同样生效）；图形会话切换或进程退出时释放。服务启动时没有图形会话则延后到首次桌面连接 |
 | portal 旋转 | 处理 `SPA_META_VideoTransform`/`wl_output.transform` 的 90/180/270 与翻转，输出方向正确的帧；输入区域由 EIS 映射 |
 | portal 光标 | 默认 `CursorMode::Hidden`，由控制端自绘指针，避免 GNOME/KDE Wayland 上出现合成器光标 + 控制端指针的双指针；`UU_PORTAL_CURSOR=embedded` 可恢复内嵌光标 |
 | 锁屏/挂起输入释放 | 锁屏、休眠、桌面 peer 结束时释放 portal 会话中仍按下的按键/鼠标键（portal 没有 release-all，宿主逐键补发，单次调用 2 秒超时；失败项保留到会话重建后重试），解锁后不会残留 Ctrl/Shift 或鼠标键 |
