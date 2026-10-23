@@ -7,6 +7,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use tokio::sync::watch;
 
@@ -17,10 +18,13 @@ pub mod audio;
 pub mod clipboard;
 pub mod cursor;
 pub mod desktop_power;
+pub mod display_mode;
 pub mod encoder;
 pub mod hevc;
 pub mod input_map;
+pub mod lease;
 pub mod portal_permissions;
+pub mod rotation;
 pub mod session_env;
 pub mod session_lock;
 pub mod session_power;
@@ -29,11 +33,18 @@ pub mod virtual_audio;
 pub use encoder::FPS;
 
 #[cfg(all(target_os = "linux", feature = "desktop"))]
+mod eis;
+#[cfg(all(target_os = "linux", feature = "desktop"))]
+pub mod uinput;
+#[cfg(all(target_os = "linux", feature = "desktop"))]
 mod uinput_scroll;
 #[cfg(not(target_os = "linux"))]
 mod unsupported;
 #[cfg(all(target_os = "linux", feature = "desktop"))]
 mod wayland;
+/// Portal denial classification used by the host supervisor.
+#[cfg(all(target_os = "linux", feature = "desktop"))]
+pub use wayland::{portal_error_code, terminal_portal_code, terminal_portal_error};
 #[cfg(all(target_os = "linux", feature = "desktop"))]
 mod wlroots;
 #[cfg(target_os = "linux")]
@@ -170,6 +181,17 @@ pub fn backend_for_source(
 }
 
 /// Resolve the selected backend from the current graphical session.
+/// Whether the portal EIS input path can be used (libei is loadable).
+#[cfg(all(target_os = "linux", feature = "desktop"))]
+pub fn libei_available() -> bool {
+    eis::EisInput::supported()
+}
+
+#[cfg(not(all(target_os = "linux", feature = "desktop")))]
+pub fn libei_available() -> bool {
+    false
+}
+
 pub async fn detect_backend(choice: BackendChoice) -> Result<Backend, String> {
     Ok(detect_backend_selection(choice).await?.0.effective)
 }
@@ -246,7 +268,7 @@ pub struct DesktopOptions {
     pub clipboard: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScreenInfo {
     pub id: u32,
     /// PipeWire node used for portal absolute-pointer input.
@@ -256,6 +278,8 @@ pub struct ScreenInfo {
     pub width: u32,
     pub height: u32,
     pub primary: bool,
+    /// Portal ScreenCast `mapping_id` for the matching EIS region.
+    pub mapping_id: Option<String>,
 }
 
 /// One pointer image from a backend that can observe the hardware cursor.
@@ -407,10 +431,19 @@ pub struct DesktopSession {
     cursor: watch::Receiver<Option<CursorImage>>,
     input: Arc<dyn InputSink>,
     stop: Arc<AtomicBool>,
-    task: tokio::task::JoinHandle<()>,
+    /// Backend task handle. Aborted after a short input-release grace period
+    /// (see [`DesktopSession::stop`]).
+    abort: tokio::task::AbortHandle,
+    /// Signalled by the portal supervisor once it has released held input.
+    cleanup: Arc<tokio::sync::Notify>,
     /// Backend-specific display wake (wlroots output power).
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
     clipboard: std::sync::Mutex<Option<clipboard::ClipboardBridge>>,
+    /// X11 display this session captures, when it has an explicit one.
+    display: Option<String>,
+    /// Keeps a changed X11 mode alive while this session runs; the last
+    /// desktop session restores the original mode when it is stopped.
+    display_guard: std::sync::Mutex<Option<Box<dyn Send + Sync>>>,
 }
 
 impl DesktopSession {
@@ -430,6 +463,18 @@ impl DesktopSession {
 
     pub fn input(&self) -> Arc<dyn InputSink> {
         self.input.clone()
+    }
+
+    /// Apply a viewer resolution choice to the host display.
+    ///
+    /// Only the X11 backend changes the desktop mode; portal and wlroots keep
+    /// the compositor geometry and expose the requested size through encoder
+    /// scaling instead. Returns the size now in use when the mode changed.
+    pub fn apply_resolution(&self, request: display_mode::Request) -> Option<(u32, u32)> {
+        if self.backend != Backend::X11 || !display_mode::enabled() {
+            return None;
+        }
+        display_mode::apply(self.display.as_deref(), request)
     }
 
     pub fn screen(&self) -> u32 {
@@ -485,8 +530,42 @@ impl DesktopSession {
     }
 
     pub fn stop(&self) {
-        self.stop.store(true, Ordering::Release);
-        self.task.abort();
+        if self.stop.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // Ask the backend to release keys and buttons it still holds. The
+        // portal supervisor signals `cleanup` when that release is done.
+        self.input.reset();
+        // Release the display-mode lease before aborting the backend task so
+        // the restore runs even when the peer keeps the session Arc alive.
+        if self.backend == Backend::X11 {
+            let _ = self
+                .display_guard
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+        }
+        let abort = self.abort.clone();
+        if self.backend != Backend::Wayland {
+            // X11 and wlroots release from their own input threads, which
+            // observe `stop`; the session task only needs aborting.
+            abort.abort();
+            return;
+        }
+        let cleanup = self.cleanup.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    // Wait for the release pass, but never leave a stuck
+                    // portal holding the task forever. Each release call has
+                    // its own 2 s bound, so a few held keys can take longer
+                    // than the old fixed delay.
+                    let _ = tokio::time::timeout(Duration::from_secs(8), cleanup.notified()).await;
+                    abort.abort();
+                });
+            }
+            Err(_) => abort.abort(),
+        }
     }
 
     /// Wake the display using this session's backend.

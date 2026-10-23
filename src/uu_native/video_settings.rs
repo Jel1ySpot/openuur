@@ -17,13 +17,17 @@ pub const QUALITY_AUTO: u64 = 5;
 pub const QUALITY_CUSTOM: u64 = 6;
 pub const CHROMA_420: u64 = 1;
 pub const CHROMA_444: u64 = 3;
+/// Upper bound for a custom cap, in kbit/s, matching the 100 Mbit/s ceiling
+/// the official host reports.
+pub const MAX_CUSTOM_KBPS: u32 = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoSettings {
     pub codec: Codec,
     pub fps: u32,
     pub quality: u64,
-    pub custom_mbps: u32,
+    /// Custom bitrate from `RpcRequest` field 8, in bit/s.
+    pub custom_bps: u32,
     pub output: Option<(u32, u32)>,
     pub chroma: u64,
 }
@@ -34,7 +38,7 @@ impl Default for VideoSettings {
             codec: Codec::H264,
             fps: 60,
             quality: QUALITY_AUTO,
-            custom_mbps: 0,
+            custom_bps: 0,
             output: None,
             chroma: CHROMA_420,
         }
@@ -58,14 +62,11 @@ impl VideoSettings {
             QUALITY_GENERAL => Some(2_000),
             QUALITY_HD => Some(8_000),
             QUALITY_BLURAY => Some(20_000),
-            QUALITY_CUSTOM if self.custom_mbps > 0 => Some(
-                if self.custom_mbps > 1_000 {
-                    self.custom_mbps
-                } else {
-                    self.custom_mbps * 1_000
-                }
-                .min(100_000),
-            ),
+            // Field 8 is bits per second (the mobile viewer sends 1_000_000
+            // for 1 Mbps). The encoder wants kbit/s, capped at 100 Mbit/s.
+            QUALITY_CUSTOM if self.custom_bps > 0 => {
+                Some((self.custom_bps / 1_000).clamp(1, MAX_CUSTOM_KBPS))
+            }
             _ => None,
         }
     }
@@ -75,10 +76,25 @@ impl VideoSettings {
     }
 }
 
+/// Initial codec once the m-line is negotiated. Hardware encoders default to
+/// H.265 (the official Mac viewer lists it first); software libx265 is far
+/// slower, so CPU hosts stay on H.264. `UU_VIDEO_CODEC=h264|h265` overrides.
 pub fn preferred_codec(h264: bool, h265: bool) -> Codec {
-    let forced_h264 =
-        std::env::var("UU_VIDEO_CODEC").is_ok_and(|value| value.eq_ignore_ascii_case("h264"));
-    if h265 && !(forced_h264 && h264) {
+    let forced = std::env::var("UU_VIDEO_CODEC")
+        .ok()
+        .map(|value| value.to_ascii_lowercase());
+    let hardware =
+        crate::desktop::encoder::detect_kind() != crate::desktop::encoder::EncoderKind::Cpu;
+    pick_codec(h264, h265, forced.as_deref(), hardware)
+}
+
+fn pick_codec(h264: bool, h265: bool, forced: Option<&str>, hardware: bool) -> Codec {
+    let wants_h265 = match forced {
+        Some("h264" | "avc") => false,
+        Some("h265" | "hevc") => true,
+        _ => hardware,
+    };
+    if h265 && (wants_h265 || !h264) {
         Codec::H265
     } else {
         Codec::H264
@@ -114,6 +130,41 @@ fn from_option(value: u64) -> Option<u64> {
     }
 }
 
+/// `max_custom_bitrate` (field 8) is bit/s: the mobile viewer sends
+/// 1_000_000 for 1 Mbps. Keep the unit exact so a legitimate low cap is not
+/// multiplied by a thousand.
+fn custom_bitrate_bps(value: u64) -> u32 {
+    value.min(u64::from(u32::MAX)) as u32
+}
+
+/// The resolution a capture/resolution RPC asks for. X11 hosts apply it to the
+/// display mode itself, like the official Windows host; other backends use it
+/// as an encoder scaling request.
+pub fn requested_resolution(rpc: &[Field]) -> Option<crate::desktop::display_mode::Request> {
+    use crate::desktop::display_mode::Request;
+    if let Some(request) = wire::blob(rpc, 2) {
+        let fields = wire::decode(request)?;
+        if wire::uint(&fields, 10) == Some(3) {
+            return Some(Request::Native);
+        }
+        let (width, height) = wire::uint(&fields, 16)
+            .zip(wire::uint(&fields, 17))
+            .or_else(|| wire::uint(&fields, 5).zip(wire::uint(&fields, 6)))?;
+        Some(Request::Size(
+            u32::try_from(width).ok()?,
+            u32::try_from(height).ok()?,
+        ))
+    } else if let Some(request) = wire::blob(rpc, 6) {
+        let fields = wire::decode(request)?;
+        Some(Request::Size(
+            u32::try_from(wire::uint(&fields, 1)?).ok()?,
+            u32::try_from(wire::uint(&fields, 2)?).ok()?,
+        ))
+    } else {
+        None
+    }
+}
+
 /// Apply an `RpcRequest` body. Returns the `RpcResponse` body when this was a
 /// settings request.
 pub fn apply_rpc(
@@ -140,7 +191,7 @@ pub fn apply_rpc(
             next.quality = quality;
         }
         if let Some(bitrate) = wire::uint(&fields, 8).filter(|value| *value > 0) {
-            next.custom_mbps = bitrate as u32;
+            next.custom_bps = custom_bitrate_bps(bitrate);
         }
         match wire::uint(&fields, 7) {
             Some(CHROMA_444)
@@ -276,8 +327,9 @@ pub fn sync_payload(settings: VideoSettings, native: (u32, u32)) -> Vec<u8> {
     put_int(1, u64::from(settings.fps), &mut out);
     put_int(2, settings.quality, &mut out);
     put_int(3, settings.chroma, &mut out);
-    if settings.custom_mbps > 0 {
-        put_int(4, u64::from(settings.custom_mbps), &mut out);
+    if settings.custom_bps > 0 {
+        // Echo the same unit the viewer sent: bit/s.
+        put_int(4, u64::from(settings.custom_bps), &mut out);
     }
     put_int(5, u64::from(size.0), &mut out);
     put_int(6, u64::from(size.1), &mut out);
@@ -313,6 +365,32 @@ mod tests {
     }
 
     #[test]
+    fn custom_bitrate_is_bits_per_second() {
+        let (tx, rx) = watch::channel(VideoSettings::default());
+        let mut body = Vec::new();
+        wire::int(2, QUALITY_CUSTOM, &mut body);
+        wire::int(8, 1_000_000, &mut body);
+        let request = wire::decode(&rpc(9, 2, &body)).unwrap();
+        apply_rpc(&request, &tx, (1920, 1080), true, true).unwrap();
+        let settings = *rx.borrow();
+        assert_eq!(settings.custom_bps, 1_000_000);
+        // 1 Mbit/s must not turn into a 100 Mbit/s cap.
+        assert_eq!(settings.max_kbps(), Some(1_000));
+        let fields = wire::decode(&sync_payload(settings, (1920, 1080))).unwrap();
+        assert_eq!(wire::uint(&fields, 4), Some(1_000_000));
+    }
+
+    #[test]
+    fn custom_bitrate_is_capped_at_100_mbit() {
+        let settings = VideoSettings {
+            quality: QUALITY_CUSTOM,
+            custom_bps: u32::MAX,
+            ..VideoSettings::default()
+        };
+        assert_eq!(settings.max_kbps(), Some(MAX_CUSTOM_KBPS));
+    }
+
+    #[test]
     fn resolution_is_clamped_to_native() {
         let (tx, rx) = watch::channel(VideoSettings::default());
         let mut body = Vec::new();
@@ -321,6 +399,44 @@ mod tests {
         let request = wire::decode(&rpc(8, 6, &body)).unwrap();
         apply_rpc(&request, &tx, (1920, 1080), true, false).unwrap();
         assert_eq!(rx.borrow().output, Some((1280, 720)));
+    }
+
+    #[test]
+    fn resolution_requests_distinguish_native_and_pixels() {
+        let mut body = Vec::new();
+        wire::int(10, 3, &mut body);
+        let request = wire::decode(&rpc(1, 2, &body)).unwrap();
+        assert_eq!(
+            requested_resolution(&request),
+            Some(crate::desktop::display_mode::Request::Native)
+        );
+
+        let mut body = Vec::new();
+        wire::int(16, 2560, &mut body);
+        wire::int(17, 1440, &mut body);
+        let request = wire::decode(&rpc(1, 2, &body)).unwrap();
+        assert_eq!(
+            requested_resolution(&request),
+            Some(crate::desktop::display_mode::Request::Size(2560, 1440))
+        );
+
+        let mut body = Vec::new();
+        wire::int(1, 1920, &mut body);
+        wire::int(2, 1080, &mut body);
+        let request = wire::decode(&rpc(2, 6, &body)).unwrap();
+        assert_eq!(
+            requested_resolution(&request),
+            Some(crate::desktop::display_mode::Request::Size(1920, 1080))
+        );
+    }
+
+    #[test]
+    fn hardware_encoders_default_to_h265_but_software_does_not() {
+        assert_eq!(pick_codec(true, true, None, true), Codec::H265);
+        assert_eq!(pick_codec(true, true, None, false), Codec::H264);
+        assert_eq!(pick_codec(true, true, Some("h264"), true), Codec::H264);
+        assert_eq!(pick_codec(true, true, Some("h265"), false), Codec::H265);
+        assert_eq!(pick_codec(false, true, None, false), Codec::H265);
     }
 
     #[test]

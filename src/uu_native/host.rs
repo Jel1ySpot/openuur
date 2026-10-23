@@ -24,6 +24,11 @@ use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::sctp_transport::sctp_transport_capabilities::SCTPTransportCapabilities;
 use webrtc::sctp_transport::sctp_transport_state::RTCSctpTransportState;
 
+/// The signaling room lease is refreshed after this much idle time. Active
+/// WebRTC peers keep the current room: reconnecting signaling under them would
+/// churn ICE candidates for no reason.
+pub const IDLE_ROOM_RENEWAL: Duration = Duration::from_secs(900);
+
 #[derive(Clone)]
 struct Route {
     client: String,
@@ -58,7 +63,12 @@ struct HostRuntime {
 }
 
 enum RoomExit {
-    Reconnect { error: String, connected: bool },
+    Reconnect {
+        error: String,
+        connected: bool,
+        /// The room API rejected the stored login token (HTTP 422 / code 1120).
+        token_expired: bool,
+    },
     Shutdown,
 }
 
@@ -117,7 +127,13 @@ impl HostPeer {
     }
 }
 
-pub async fn run(config: Config, password: Option<String>) -> Result<()> {
+pub async fn run(mut config: Config, password: Option<String>) -> Result<()> {
+    // Detect HEVC once per process, in the background: `ffmpeg -encoders`
+    // lists encoders whose driver cannot initialize, so only a real frame is
+    // trustworthy. Negotiation reads the cached result.
+    tokio::spawn(async {
+        crate::desktop::encoder::probe_hevc_available().await;
+    });
     crate::desktop::virtual_audio::init();
     let _virtual_audio = crate::desktop::virtual_audio::Cleanup;
     // Discover the login session even before the first peer so a system
@@ -130,6 +146,7 @@ pub async fn run(config: Config, password: Option<String>) -> Result<()> {
         outbox: Outbox::new(),
     };
     let mut backoff = Duration::from_secs(3);
+    let mut expired_logged = false;
     // Registered once for the whole process: during reconnect backoff and
     // capture startup, SIGTERM must still stop the daemon cleanly.
     let mut terminate =
@@ -144,10 +161,45 @@ pub async fn run(config: Config, password: Option<String>) -> Result<()> {
         };
         match exit {
             RoomExit::Shutdown => break,
-            RoomExit::Reconnect { error, connected } => {
-                tracing::warn!("native UU host: {error}");
+            RoomExit::Reconnect {
+                error,
+                connected,
+                token_expired,
+            } => {
+                if !(token_expired && expired_logged) {
+                    // An unchanged expired token would otherwise warn every
+                    // 30 s; the dedicated message below already explains it.
+                    tracing::warn!("native UU host: {error}");
+                }
                 if connected {
                     backoff = Duration::from_secs(3);
+                    expired_logged = false;
+                }
+                if token_expired {
+                    // The room API rejected the stored token. Re-read the
+                    // config so a login performed while the service was
+                    // running is picked up without a restart; otherwise wait
+                    // for one and say so once.
+                    match config.reload_token() {
+                        Some(token) if config.token.as_deref() != Some(token.as_str()) => {
+                            tracing::info!(
+                                "native UU login token changed on disk; reconnecting with the new token"
+                            );
+                            config.token = Some(token);
+                            backoff = Duration::from_secs(1);
+                            expired_logged = false;
+                        }
+                        _ => {
+                            if !expired_logged {
+                                tracing::warn!(
+                                    "native UU login token expired; run `openuur login` for this account. \
+                                     The service keeps retrying and adopts the new token automatically."
+                                );
+                                expired_logged = true;
+                            }
+                            backoff = Duration::from_secs(30);
+                        }
+                    }
                 }
                 // Session changes still invalidate desktop captures while
                 // signaling is down, so a dead compositor is not held pinned
@@ -185,6 +237,7 @@ async fn enter_room(config: &Config, runtime: &mut HostRuntime) -> RoomExit {
         Ok(room) => room,
         Err(error) => {
             return RoomExit::Reconnect {
+                token_expired: error.is_token_expired(),
                 error: error.to_string(),
                 connected: false,
             }
@@ -196,6 +249,7 @@ async fn enter_room(config: &Config, runtime: &mut HostRuntime) -> RoomExit {
             return RoomExit::Reconnect {
                 error,
                 connected: false,
+                token_expired: false,
             }
         }
     };
@@ -209,6 +263,10 @@ async fn enter_room(config: &Config, runtime: &mut HostRuntime) -> RoomExit {
 async fn room_loop(config: &Config, runtime: &mut HostRuntime, signal: &mut Signal) -> RoomExit {
     let mut tick = tokio::time::interval(Duration::from_secs(2));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // A sleep (rather than an interval) lets an active session defer the
+    // renewal by one minute without burning the full 900 seconds again.
+    let renewal = tokio::time::sleep(IDLE_ROOM_RENEWAL);
+    tokio::pin!(renewal);
     let mut session_rx = session_env::subscribe();
     // Apply a session change that happened while signaling was disconnected.
     let current = session_rx.borrow_and_update().available().cloned();
@@ -221,10 +279,15 @@ async fn room_loop(config: &Config, runtime: &mut HostRuntime, signal: &mut Sign
                     return RoomExit::Reconnect {
                         error: "signaling stream ended".to_owned(),
                         connected: true,
+                        token_expired: false,
                     };
                 };
                 match message {
-                    Event::Closed(error) => return RoomExit::Reconnect { error, connected: true },
+                    Event::Closed(error) => return RoomExit::Reconnect {
+                        error,
+                        connected: true,
+                        token_expired: false,
+                    },
                     Event::Text { name, data } | Event::Binary { name, data, .. } if name == "bmsg_push" => {
                         let status = data.get("data").and_then(|d| d.get("status")).and_then(Value::as_str).unwrap_or("-");
                         let available = data.get("data").and_then(|d| d.get("publisher_availability_status")).and_then(Value::as_str).unwrap_or("-");
@@ -248,12 +311,48 @@ async fn room_loop(config: &Config, runtime: &mut HostRuntime, signal: &mut Sign
                         .await;
                     }
                     Event::Text { name, data } | Event::Binary { name, data, .. } if name == "released" || name == "left" || name == "leave" => {
-                        release(&mut runtime.peers, &data).await;
+                        let room_level = release(&mut runtime.peers, &data).await;
+                        if room_level {
+                            // No ice_id: this is a room-level event, not a
+                            // peer release. Keep terminal/file/port-mapping
+                            // sessions and renew signaling instead.
+                            tracing::warn!(
+                                "native UU room {name} without a peer id; renewing signaling (connected peers stay up)"
+                            );
+                            return RoomExit::Reconnect {
+                                error: format!("room {name} without a peer id"),
+                                connected: true,
+                                token_expired: false,
+                            };
+                        }
                     }
                     _ => {}
                 }
             }
             _ = tick.tick() => maintain(runtime).await,
+            _ = &mut renewal => {
+                let active = runtime.peers.values().any(|peer| {
+                    peer.pc.connection_state() == RTCPeerConnectionState::Connected
+                });
+                if active {
+                    tracing::info!(
+                        "signaling room renewal deferred: a remote peer is still connected"
+                    );
+                    renewal
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + Duration::from_secs(60));
+                } else {
+                    tracing::info!(
+                        "signaling room idle for {} s; refreshing room credentials",
+                        IDLE_ROOM_RENEWAL.as_secs()
+                    );
+                    return RoomExit::Reconnect {
+                        error: "idle signaling room renewal".to_owned(),
+                        connected: true,
+                        token_expired: false,
+                    };
+                }
+            }
             changed = session_rx.changed() => {
                 if changed.is_ok() {
                     let current = session_rx.borrow_and_update().available().cloned();
@@ -794,6 +893,7 @@ fn install_host_channels_legacy(
                 || label == "TEXT_DATA_CHANNEL"
                 || label == "BINARY_DATA_CHANNEL"
                 || label == "FILE_DATA_CHANNEL"
+                || label.contains("STREAMER")
             {
                 let manager = manager.clone();
                 let terminal = terminal.clone();
@@ -811,7 +911,7 @@ fn install_host_channels_legacy(
                     Box::pin(async move {
                         let data = message.data.to_vec();
                         if let Some((port_mapping, file_transfer)) = &port_mapping {
-                            if port_mapping.handle(&data, &label) {
+                            if port_mapping.handle(&data, &label).await {
                                 return;
                             }
                             if label == "FILE_DATA_CHANNEL"
@@ -1059,6 +1159,12 @@ async fn send_framed(
         .is_ok()
 }
 
+/// Reply body for the official viewer's STREAMER telemetry ping.
+pub fn streamer_pong(data: &[u8]) -> Option<&'static [u8]> {
+    let value: Value = serde_json::from_slice(data).ok()?;
+    (value.get("type").and_then(Value::as_str) == Some("ping")).then_some(br#"{"type":"pong"}"#)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn install_host_channels(
     pc: &Arc<webrtc::peer_connection::RTCPeerConnection>,
@@ -1077,11 +1183,39 @@ fn install_host_channels(
 ) {
     let sequence = Arc::new(AtomicU64::new(1));
     // Every desktop peer maps controller shortcuts in front of the backend.
+    // The lease makes the newest desktop peer the only one that can inject:
+    // a delayed event from a replaced peer is dropped, including its releases.
     let mapped_input: Option<Arc<dyn crate::desktop::InputSink>> =
         desktop.as_ref().map(|desktop| {
+            let lease = crate::desktop::lease::InputLease::claim(desktop.input());
+            {
+                let lease = lease.clone();
+                let pc = pc.clone();
+                tokio::spawn(async move {
+                    use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+                    loop {
+                        match pc.connection_state() {
+                            RTCPeerConnectionState::Connected => lease.activate(),
+                            RTCPeerConnectionState::Disconnected
+                            | RTCPeerConnectionState::Closed
+                            | RTCPeerConnectionState::Failed => lease.deactivate(),
+                            _ => {}
+                        }
+                        if matches!(
+                            pc.connection_state(),
+                            RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed
+                        ) {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                });
+            }
+            let input: Arc<dyn crate::desktop::InputSink> =
+                Arc::new(crate::desktop::lease::LeasedInput::new(lease));
             Arc::new(
                 crate::desktop::input_map::MappedInput::new(
-                    desktop.input(),
+                    input,
                     controller_mac,
                     desktop.backend == crate::desktop::Backend::X11,
                 )
@@ -1428,6 +1562,8 @@ fn install_host_channels(
                             .as_ref()
                             .map(|track| track.available())
                             .unwrap_or((true, false));
+                        let h265 = h265
+                            && crate::desktop::encoder::hevc_available();
                         let codecs =
                             crate::uu_native::video_settings::codec_negotiation(
                                 width,
@@ -1546,6 +1682,7 @@ fn install_host_channels(
                 || label == "TEXT_DATA_CHANNEL"
                 || label == "BINARY_DATA_CHANNEL"
                 || label == "FILE_DATA_CHANNEL"
+                || label.contains("STREAMER")
             {
                 let manager = manager.clone();
                 let terminal = terminal.clone();
@@ -1578,7 +1715,18 @@ fn install_host_channels(
                     let lock_watch = crate::desktop::session_lock::watch_locked();
                     Box::pin(async move {
                         let data = message.data.to_vec();
-                        if port_mapping.handle(&data, &label) {
+                        if label.contains("STREAMER") {
+                            // The official viewer probes this telemetry channel
+                            // with JSON pings. Answer immediately; never feed
+                            // telemetry into the input/clipboard decoders.
+                            if let Some(pong) = streamer_pong(&data) {
+                                let _ = channel
+                                    .send(&bytes::Bytes::from_static(pong))
+                                    .await;
+                            }
+                            return;
+                        }
+                        if port_mapping.handle(&data, &label).await {
                             return;
                         }
                         // Viewers put FileTransferFtp RPCs on CONTROL; accept
@@ -1745,11 +1893,38 @@ fn install_host_channels(
                                                 .as_ref()
                                                 .map(|track| track.available())
                                                 .unwrap_or((true, false));
+                                            let h265 = h265
+                                                && crate::desktop::encoder::hevc_available();
+                                            // X11 changes the host display mode for the
+                                            // viewer's resolution choice. Probe the mode
+                                            // transaction synchronously on a worker before
+                                            // applying the settings against the new size.
+                                            let requested = crate::uu_native::video_settings::requested_resolution(&rpc_fields);
+                                            let native = if desktop.backend
+                                                == crate::desktop::Backend::X11
+                                                && crate::desktop::display_mode::enabled()
+                                            {
+                                                match requested {
+                                                    Some(request) => {
+                                                        let resize = desktop.clone();
+                                                        tokio::task::spawn_blocking(move || {
+                                                            resize.apply_resolution(request)
+                                                        })
+                                                        .await
+                                                        .ok()
+                                                        .flatten()
+                                                        .unwrap_or_else(|| desktop.active_size())
+                                                    }
+                                                    None => desktop.active_size(),
+                                                }
+                                            } else {
+                                                desktop.active_size()
+                                            };
                                             if let Some(response) =
                                                 crate::uu_native::video_settings::apply_rpc(
                                                     &rpc_fields,
                                                     settings,
-                                                    desktop.active_size(),
+                                                    native,
                                                     h264,
                                                     h265,
                                                 )
@@ -1758,7 +1933,7 @@ fn install_host_channels(
                                                 let sync =
                                                     crate::uu_native::video_settings::sync_payload(
                                                         *settings.borrow(),
-                                                        desktop.active_size(),
+                                                        native,
                                                     );
                                                 send_framed(&channel, &sequence, 25, &sync).await;
                                             }
@@ -2285,19 +2460,42 @@ fn cancel_pending_desktop(runtime: &mut HostRuntime) {
     }
 }
 
-async fn release(peers: &mut HashMap<String, HostPeer>, data: &Value) {
+/// Close the peers named by a release event. Returns true when the event had
+/// no peer identifier at all: that is a room-level event and must not tear
+/// down the terminal, file, and port-mapping peers connected to this room.
+/// Releases may name the peer by `ice_id`, `client_id`, or `app_control_id`.
+async fn release(peers: &mut HashMap<String, HostPeer>, data: &Value) -> bool {
     let body = data.get("data").unwrap_or(data);
-    let ice = body.get("ice_id").and_then(Value::as_str).unwrap_or("");
+    let field = |keys: &[&str]| -> Option<&str> {
+        keys.iter()
+            .find_map(|key| body.get(*key).or_else(|| data.get(*key)))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    let ice = field(&["ice_id", "iceId"]);
+    let client = field(&["client_id", "clientId"]);
+    let app = field(&["app_control_id", "appControlId"]);
+    if ice.is_none() && client.is_none() && app.is_none() {
+        return true;
+    }
     let keys: Vec<String> = peers
-        .keys()
-        .filter(|key| ice.is_empty() || key.as_str() == ice)
-        .cloned()
+        .iter()
+        .filter(|(_, peer)| match (ice, client, app) {
+            (Some(ice), _, _) => peer.route.ice == ice,
+            (None, Some(client), app) => {
+                peer.route.client == client && app.is_none_or(|app| peer.route.app == app)
+            }
+            (None, None, Some(app)) => peer.route.app == app,
+            (None, None, None) => false,
+        })
+        .map(|(key, _)| key.clone())
         .collect();
     for key in keys {
         if let Some(peer) = peers.remove(&key) {
             peer.close().await;
         }
     }
+    false
 }
 
 fn handle_desktop_input(input: Arc<dyn InputSink>, value: &Value) -> bool {
@@ -2396,6 +2594,38 @@ fn find_str(value: &Value, keys: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streamer_ping_gets_pong_and_telemetry_is_ignored() {
+        assert_eq!(
+            streamer_pong(br#"{"type":"ping"}"#),
+            Some(&br#"{"type":"pong"}"#[..])
+        );
+        assert_eq!(streamer_pong(br#"{"type":"stats"}"#), None);
+        assert_eq!(streamer_pong(b"not-json"), None);
+    }
+
+    #[test]
+    fn idle_room_renewal_is_nine_hundred_seconds() {
+        assert_eq!(IDLE_ROOM_RENEWAL.as_secs(), 900);
+    }
+
+    #[test]
+    fn room_level_release_keeps_peers() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut peers = HashMap::new();
+            // No peer id: a room-level event, not a request to close peers.
+            assert!(release(&mut peers, &json!({"data": {"ice_id": ""}})).await);
+            assert!(release(&mut peers, &json!({"data": {}})).await);
+            // A named peer release is not room-level.
+            assert!(!release(&mut peers, &json!({"ice_id": "missing"})).await);
+            assert!(!release(&mut peers, &json!({"data": {"client_id": "viewer"}})).await);
+        });
+    }
 
     #[test]
     fn terminal_connect_options_are_remembered() {

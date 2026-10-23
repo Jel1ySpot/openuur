@@ -9,6 +9,7 @@ pub mod api;
 pub mod auth;
 pub mod config;
 pub mod desktop;
+pub mod doctor;
 pub mod error;
 pub mod install;
 pub mod terminal;

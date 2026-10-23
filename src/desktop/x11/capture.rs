@@ -247,6 +247,7 @@ fn refresh_layout(connection: &impl Connection, root: u32, state: &DesktopState)
             width: u32::from(reply.width),
             height: u32::from(reply.height),
             primary: true,
+            mapping_id: None,
         }]
     };
     if screens == state.screens() {

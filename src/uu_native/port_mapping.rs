@@ -13,7 +13,11 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
-type StreamWriter = (mpsc::Sender<Vec<u8>>, tokio::task::AbortHandle);
+type StreamWriter = (
+    mpsc::Sender<Vec<u8>>,
+    tokio::task::AbortHandle,
+    tokio::task::AbortHandle,
+);
 
 const MESSAGE_FIELD: u32 = 27;
 const SYN: u64 = 0;
@@ -23,6 +27,9 @@ const SYN_ACK: u64 = 3;
 const PROTOCOL_VERSION: u64 = 1;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_CHUNK: usize = 16 * 1024;
+/// Frames buffered per direction before the stream is failed. Neither queue
+/// is awaited on the data-channel callback: it is shared with file transfer
+/// and its SCTP association also carries desktop input and terminal traffic.
 const WRITE_QUEUE_FRAMES: usize = 256;
 
 pub fn enabled() -> bool {
@@ -124,8 +131,10 @@ impl PortMapping {
     }
 
     /// Handles one complete DataChannel message. Returns true when it was a
-    /// port-mapping message.
-    pub fn handle(self: &Arc<Self>, data: &[u8], channel: &str) -> bool {
+    /// port-mapping message. Queues never await: a full queue fails the
+    /// mapping stream cleanly (FIN + target close) rather than blocking the
+    /// shared data channel or dropping bytes mid-stream.
+    pub async fn handle(self: &Arc<Self>, data: &[u8], channel: &str) -> bool {
         let Some(fields) = wire::decode(data) else {
             return false;
         };
@@ -147,7 +156,7 @@ impl PortMapping {
         let kind = wire::uint(&frame, 4).unwrap_or(SYN);
         let payload = wire::blob(&frame, 5).unwrap_or_default();
         match kind {
-            SYN => self.syn(key, payload),
+            SYN => self.syn(key, payload).await,
             DATA => {
                 let writer = self
                     .streams
@@ -157,12 +166,21 @@ impl PortMapping {
                     .map(|stream| stream.0.clone());
                 match writer {
                     Some(writer) => {
+                        // Never await here: this runs on the shared file data
+                        // channel, and blocking it would also stall the SCTP
+                        // association (desktop input and terminal). Overflow
+                        // fails the mapping cleanly instead of dropping bytes
+                        // in the middle of the relayed TCP stream.
                         if writer.try_send(payload.to_vec()).is_err() {
-                            tracing::warn!("port mapping writer queue full");
+                            tracing::warn!(
+                                "port mapping target is not draining; closing the stream"
+                            );
                             self.close(&key, true);
                         }
                     }
-                    None => self.send(key, FIN, Vec::new()),
+                    None => {
+                        self.send(key, FIN, Vec::new());
+                    }
                 }
             }
             FIN => self.close(&key, false),
@@ -171,18 +189,23 @@ impl PortMapping {
         true
     }
 
-    fn send(&self, key: Key, kind: u64, payload: Vec<u8>) {
+    /// Queue one outbound frame without awaiting. Returns false when the
+    /// viewer channel could not accept it, so the caller can fail the mapping
+    /// instead of leaving a silently truncated TCP stream.
+    fn send(&self, key: Key, kind: u64, payload: Vec<u8>) -> bool {
         let message = wire::message(
             self.sequence.fetch_add(1, Ordering::Relaxed),
             MESSAGE_FIELD,
             &frame(&key, kind, &payload),
         );
         if self.outbound.try_send(message).is_err() {
-            tracing::warn!("port mapping outbound queue full");
+            tracing::warn!("port mapping outbound queue is full");
+            return false;
         }
+        true
     }
 
-    fn syn(self: &Arc<Self>, key: Key, payload: &[u8]) {
+    async fn syn(self: &Arc<Self>, key: Key, payload: &[u8]) {
         let request = if enabled() {
             parse_syn(payload)
         } else {
@@ -191,7 +214,7 @@ impl PortMapping {
         let (host, port) = match request {
             Ok(target) => target,
             Err(error) => {
-                self.send(key, SYN_ACK, syn_ack(false, Some(&error)));
+                let _ = self.send(key, SYN_ACK, syn_ack(false, Some(&error)));
                 return;
             }
         };
@@ -205,7 +228,7 @@ impl PortMapping {
             let stream = match connected {
                 Ok(Ok(stream)) => stream,
                 Ok(Err(error)) => {
-                    mapping.send(
+                    let _ = mapping.send(
                         key,
                         SYN_ACK,
                         syn_ack(false, Some(&format!("connect failed: {}", error.kind()))),
@@ -213,15 +236,15 @@ impl PortMapping {
                     return;
                 }
                 Err(_) => {
-                    mapping.send(key, SYN_ACK, syn_ack(false, Some("connect timeout")));
+                    let _ = mapping.send(key, SYN_ACK, syn_ack(false, Some("connect timeout")));
                     return;
                 }
             };
             let _ = stream.set_nodelay(true);
             let (mut read, mut write) = stream.into_split();
             let (writer, mut writes) = mpsc::channel::<Vec<u8>>(WRITE_QUEUE_FRAMES);
-            mapping.send(key.clone(), SYN_ACK, syn_ack(true, None));
-            tokio::spawn(async move {
+            let _ = mapping.send(key.clone(), SYN_ACK, syn_ack(true, None));
+            let write_task = tokio::spawn(async move {
                 while let Some(data) = writes.recv().await {
                     if write.write_all(&data).await.is_err() {
                         break;
@@ -242,35 +265,73 @@ impl PortMapping {
                         Ok(0) | Err(_) => break,
                         Ok(length) => {
                             let payload = buffer[..length].to_vec();
-                            reader_mapping.send(reader_key.clone(), DATA, payload);
+                            if !reader_mapping.send(reader_key.clone(), DATA, payload) {
+                                tracing::warn!(
+                                    "port mapping viewer channel is not draining; closing the mapping"
+                                );
+                                if reader_mapping.finish_local(&reader_key) {
+                                    let _ =
+                                        reader_mapping.send(reader_key.clone(), FIN, Vec::new());
+                                }
+                                break;
+                            }
                         }
                     }
                 }
-                reader_mapping.close(&reader_key, true);
+                reader_mapping.finish_reader(reader_key);
             });
-            mapping
-                .streams
-                .lock()
-                .unwrap()
-                .insert(key, (writer, reader.abort_handle()));
+            mapping.streams.lock().unwrap().insert(
+                key,
+                (writer, reader.abort_handle(), write_task.abort_handle()),
+            );
             let _ = registered.send(());
         });
     }
 
+    /// The target reached EOF. Remove the stream without aborting this
+    /// reader (aborting from inside its own task would cancel the FIN send),
+    /// then tell the viewer once the FIN is queued.
+    fn finish_reader(&self, key: Key) {
+        let removed = self.streams.lock().unwrap().remove(&key);
+        if let Some((writer, _reader, write_task)) = removed {
+            write_task.abort();
+            drop(writer);
+            let _ = self.send(key, FIN, Vec::new());
+        }
+    }
+
+    /// Remove the stream from its own reader task after the viewer channel
+    /// stalled: stop the write task and close the target socket, without
+    /// aborting the current task.
+    fn finish_local(&self, key: &Key) -> bool {
+        match self.streams.lock().unwrap().remove(key) {
+            Some((writer, _reader, write_task)) => {
+                write_task.abort();
+                drop(writer);
+                true
+            }
+            None => false,
+        }
+    }
+
     fn close(&self, key: &Key, send_fin: bool) {
         let removed = self.streams.lock().unwrap().remove(key);
-        if let Some((_, reader)) = removed {
+        if let Some((writer, reader, write_task)) = removed {
             reader.abort();
+            write_task.abort();
+            drop(writer);
             if send_fin {
-                self.send(key.clone(), FIN, Vec::new());
+                let _ = self.send(key.clone(), FIN, Vec::new());
             }
         }
     }
 
     pub fn shutdown(&self) {
         let streams: Vec<_> = self.streams.lock().unwrap().drain().collect();
-        for (_, (_, reader)) in streams {
+        for (_, (writer, reader, write_task)) in streams {
             reader.abort();
+            write_task.abort();
+            drop(writer);
         }
     }
 }
@@ -300,5 +361,31 @@ mod tests {
         assert_eq!(Id::of(&fields, 1), Id::Bytes(b"s1".to_vec()));
         assert_eq!(Id::of(&fields, 2), Id::Varint(7));
         assert_eq!(Id::of(&fields, 3), Id::Varint(300));
+    }
+
+    #[tokio::test]
+    async fn finish_reader_removes_the_stream_and_queues_fin() {
+        let (outbound, mut queued) = mpsc::channel(4);
+        let mapping = PortMapping::new(outbound, Arc::new(AtomicU64::new(1)));
+        let key = Key {
+            session: Id::Varint(1),
+            rule: Id::Varint(2),
+            stream: Id::Varint(3),
+        };
+        let (writer, _writes) = mpsc::channel(1);
+        let reader = tokio::spawn(std::future::pending::<()>()).abort_handle();
+        let write_task = tokio::spawn(std::future::pending::<()>()).abort_handle();
+        mapping
+            .streams
+            .lock()
+            .unwrap()
+            .insert(key.clone(), (writer, reader, write_task));
+        mapping.finish_reader(key.clone());
+        assert!(mapping.streams.lock().unwrap().is_empty());
+        let message = queued.recv().await.expect("FIN should be queued");
+        let outer = wire::decode(&message).unwrap();
+        let raw = wire::blob(&outer, MESSAGE_FIELD).unwrap();
+        let fields = wire::decode(raw).unwrap();
+        assert_eq!(wire::uint(&fields, 4), Some(FIN));
     }
 }

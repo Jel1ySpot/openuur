@@ -13,12 +13,87 @@ use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
+/// Minimum gap between encoder restarts triggered by RTCP keyframe requests.
+const KEYFRAME_MIN_INTERVAL: Duration = Duration::from_millis(500);
+
 pub async fn add_track(pc: &Arc<RTCPeerConnection>) -> Result<Arc<VideoTrack>, String> {
     let track = Arc::new(VideoTrack::new());
-    pc.add_track(track.clone())
+    let sender = pc
+        .add_track(track.clone())
         .await
         .map_err(|error| format!("add video track: {error}"))?;
+    spawn_rtcp_feedback(pc.clone(), sender, track.clone());
     Ok(track)
+}
+
+/// Read RTCP for the outgoing video track and record keyframe requests. The
+/// official viewer sends PLI (and sometimes FIR) after packet loss; without a
+/// reader the host only recovers at the next GOP boundary.
+fn spawn_rtcp_feedback(
+    pc: Arc<RTCPeerConnection>,
+    sender: Arc<webrtc::rtp_transceiver::rtp_sender::RTCRtpSender>,
+    track: Arc<VideoTrack>,
+) {
+    use webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
+    use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+    // Only a weak reference: a blocked `read_rtcp` must not keep the whole
+    // peer connection alive after the viewer goes away.
+    let state = Arc::downgrade(&pc);
+    let task = tokio::spawn(async move {
+        loop {
+            match sender.read_rtcp().await {
+                Ok((packets, _)) => {
+                    if packets.iter().any(|packet| {
+                        packet
+                            .as_any()
+                            .downcast_ref::<PictureLossIndication>()
+                            .is_some()
+                            || packet.as_any().downcast_ref::<FullIntraRequest>().is_some()
+                    }) {
+                        track.request_keyframe();
+                    }
+                }
+                Err(error) => {
+                    let Some(pc) = state.upgrade() else {
+                        break;
+                    };
+                    let closed = matches!(
+                        pc.connection_state(),
+                        RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed
+                    );
+                    drop(pc);
+                    if closed {
+                        break;
+                    }
+                    tracing::debug!("video RTCP reader interrupted: {error}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    });
+    // `read_rtcp` can stay blocked on a sender that never started (an offer
+    // that is cancelled before negotiation). Abort it once the peer is gone
+    // so the connection, track, and scopes are released.
+    let abort = task.abort_handle();
+    let state = Arc::downgrade(&pc);
+    tokio::spawn(async move {
+        loop {
+            let Some(pc) = state.upgrade() else {
+                abort.abort();
+                break;
+            };
+            let closed = matches!(
+                pc.connection_state(),
+                RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed
+            );
+            drop(pc);
+            if closed {
+                abort.abort();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    });
 }
 
 pub async fn add_audio_track(
@@ -47,8 +122,18 @@ pub fn spawn(
             return;
         }
         let (available_h264, available_h265) = track.available();
+        let h265_ready = crate::desktop::encoder::probe_hevc_available().await && available_h265;
         let initial = *settings.borrow();
-        let mut current = if initial.codec == Codec::H265 && available_h265 {
+        let preferred = video_settings::preferred_codec(available_h264, h265_ready);
+        let initial = if initial.codec == Codec::H265 && h265_ready {
+            initial
+        } else {
+            VideoSettings {
+                codec: preferred,
+                ..initial
+            }
+        };
+        let mut current = if initial.codec == Codec::H265 && h265_ready {
             initial
         } else if available_h264 {
             VideoSettings {
@@ -76,6 +161,7 @@ pub fn spawn(
         let mut tick = tokio::time::interval(Duration::from_millis(5));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_tick = tokio::time::Instant::now();
+        let mut last_keyframe: Option<std::time::Instant> = None;
         loop {
             tick.tick().await;
             if matches!(
@@ -91,7 +177,7 @@ pub fn spawn(
                 continue;
             }
             let next = *settings.borrow();
-            let next = if next.codec == Codec::H265 && available_h265 {
+            let next = if next.codec == Codec::H265 && h265_ready {
                 next
             } else if available_h264 {
                 VideoSettings {
@@ -114,11 +200,11 @@ pub fn spawn(
                 }) {
                     continue;
                 }
-                let codec = if next.codec == Codec::H265 && available_h265 {
+                let codec = if next.codec == Codec::H265 && h265_ready {
                     Codec::H265
                 } else if available_h264 {
                     Codec::H264
-                } else if available_h265 {
+                } else if h265_ready {
                     Codec::H265
                 } else {
                     break;
@@ -153,6 +239,22 @@ pub fn spawn(
                 last_black = None;
                 encoder = None;
             }
+            // RTCP PLI/FIR: ffmpeg has no control socket to force an intra
+            // frame, so restart the encoder to emit one immediately. Coalesce
+            // bursts; each restart costs one process spawn.
+            let mut keyframe_restart = false;
+            // Evaluate the cheap gates first: `take_keyframe_request` consumes
+            // the flag, so a request that arrives inside the throttle window
+            // must stay pending until the window passes.
+            if encoder.is_some()
+                && last_keyframe.is_none_or(|at| at.elapsed() >= KEYFRAME_MIN_INTERVAL)
+                && track.take_keyframe_request()
+            {
+                tracing::debug!("viewer requested a keyframe; restarting the encoder");
+                encoder = None;
+                last_keyframe = Some(std::time::Instant::now());
+                keyframe_restart = true;
+            }
             let (native_width, native_height) = desktop.active_size();
             let mut config = config_for(native_width, native_height, next);
             if force_cpu {
@@ -165,22 +267,44 @@ pub fn spawn(
                 .as_ref()
                 .is_none_or(|encoder| encoder.config() != config);
             if restart {
+                // A restart caused by the capture size also needs a fresh
+                // settings sync, even if VideoSettings did not change.
+                let config_changed = encoder
+                    .as_ref()
+                    .is_some_and(|encoder| encoder.config() != config);
                 if encoder.is_some() {
                     tracing::info!("restarting desktop encoder: {config:?}");
                 }
                 match Encoder::start_config(config) {
                     Ok(started) => {
                         encoder = Some(started);
+                        // A fresh encoder always starts with a keyframe.
+                        let _ = track.take_keyframe_request();
+                        let changed = next != current;
                         current = next;
-                        announce(
-                            &outbox, &client_id, &ice_id, &app_id, &desktop, &track, current,
-                        );
+                        // A keyframe restart keeps the announced settings;
+                        // configuration changes (including a new native size)
+                        // need a new sync.
+                        if !keyframe_restart || changed || config_changed {
+                            announce(
+                                &outbox, &client_id, &ice_id, &app_id, &desktop, &track, current,
+                            );
+                        }
                     }
                     Err(error) => {
                         tracing::warn!(
                             "desktop encoder {} unavailable: {error}",
                             config.kind.label()
                         );
+                        if config.kind != crate::desktop::encoder::EncoderKind::Cpu {
+                            // The real HEVC probe may have succeeded through
+                            // the software fallback while this hardware
+                            // encoder cannot initialize. Retry once with the
+                            // matching libx264/libx265 encoder.
+                            force_cpu = true;
+                            encoder = None;
+                            continue;
+                        }
                         return;
                     }
                 }
@@ -240,6 +364,7 @@ fn config_for(width: u32, height: u32, settings: VideoSettings) -> EncoderConfig
     config.fps = settings.fps;
     config.codec = settings.codec;
     config.max_kbps = settings.max_kbps();
+    config.cq = settings.cq();
     config.chroma = settings.chroma;
     config.kind = crate::desktop::encoder::detect_kind();
     if !crate::desktop::encoder::full_chroma_available(config.kind) {
@@ -336,6 +461,7 @@ fn codec_caps(
     full_chroma: bool,
 ) -> Vec<serde_json::Value> {
     let (h264, h265) = track.available();
+    let h265 = h265 && crate::desktop::encoder::hevc_available();
     let mut caps = Vec::new();
     // The first entry carries the maximum size, as the official hosts do.
     for codec in [h264.then_some(1u64), h265.then_some(2u64)]

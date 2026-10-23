@@ -373,6 +373,9 @@ impl InputSink for MappedInput {
                 if lock.has_changed().unwrap_or(false) {
                     let _ = lock.borrow_and_update();
                     state.reset(self.inner.as_ref());
+                    // Also ask the backend to release keys/buttons that were
+                    // pressed without translation (portal has no release-all).
+                    self.inner.reset();
                 }
             }
             state.key(
@@ -399,6 +402,8 @@ impl InputSink for MappedInput {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.reset(self.inner.as_ref());
+        drop(state);
+        self.inner.reset();
     }
 }
 

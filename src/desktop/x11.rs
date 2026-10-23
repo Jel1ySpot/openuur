@@ -76,6 +76,13 @@ pub(crate) async fn start_at_with(
     }
     let display = display.map(str::to_owned);
     let explicit_display = display.is_some();
+    // Keep the resolved server for xrandr: the ambient DISPLAY can change
+    // while a session is alive, but mode restore must target this server.
+    let session_display = display.clone().or_else(|| {
+        std::env::var("DISPLAY")
+            .ok()
+            .filter(|value| !value.is_empty())
+    });
     let probe = {
         let display = display.clone();
         // A stalled display socket must not wedge session start-up. The
@@ -99,15 +106,32 @@ pub(crate) async fn start_at_with(
     ));
     let (cursor_tx, cursor) = watch::channel(None);
     let stop = Arc::new(AtomicBool::new(false));
-    let input = input::start(display.clone(), state.clone(), stop.clone(), locked.clone()).await?;
+    let input: Arc<dyn super::InputSink> = if super::uinput::wanted(super::Backend::X11) {
+        match super::uinput::UinputInput::open() {
+            Ok(input) => {
+                tracing::info!("desktop input: uinput virtual keyboard and pointer");
+                Arc::new(input)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "uinput unavailable ({}); falling back to XTest input",
+                    error.kind()
+                );
+                input::start(display.clone(), state.clone(), stop.clone(), locked.clone()).await?
+            }
+        }
+    } else {
+        input::start(display.clone(), state.clone(), stop.clone(), locked.clone()).await?
+    };
     capture::start(display.clone(), &probe, state.clone(), stop.clone(), locked).await?;
-    if let Err(error) = cursor::start(display, cursor_tx, stop.clone()) {
+    if let Err(error) = cursor::start(display.clone(), cursor_tx, stop.clone()) {
         // Cursor shapes are a nice-to-have; capture and input still work.
         tracing::warn!("X11 cursor tracking unavailable: {error}");
     }
     // Capture and input threads poll `stop`; this task only gives
     // `DesktopSession::stop` something to abort.
     let task = tokio::spawn(std::future::pending::<()>());
+    let abort = task.abort_handle();
     // An explicit display is a test or alternate server; waking through it is
     // not the same as waking the ambient session.
     if !explicit_display {
@@ -120,9 +144,12 @@ pub(crate) async fn start_at_with(
         cursor,
         input,
         stop,
-        task,
+        abort,
+        cleanup: Arc::new(tokio::sync::Notify::new()),
         wake: None,
         clipboard: Mutex::new(None),
+        display: session_display,
+        display_guard: Mutex::new(Some(Box::new(super::display_mode::StreamGuard::new()))),
     })
 }
 
@@ -217,6 +244,7 @@ fn probe(display: Option<&str>) -> Result<Probe, String> {
             width: u32::from(screen.width_in_pixels),
             height: u32::from(screen.height_in_pixels),
             primary: true,
+            mapping_id: None,
         });
     }
     let active = screens
@@ -264,6 +292,7 @@ pub(crate) fn randr_monitors(
             width: u32::from(monitor.width),
             height: u32::from(monitor.height),
             primary: monitor.primary,
+            mapping_id: None,
         })
         .collect();
     (!monitors.is_empty()).then_some(monitors)

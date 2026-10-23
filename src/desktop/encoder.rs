@@ -6,6 +6,8 @@
 
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
@@ -57,6 +59,8 @@ pub struct EncoderConfig {
     pub kind: EncoderKind,
     /// Bitrate cap in kbit/s; `None` uses constant quality.
     pub max_kbps: Option<u32>,
+    /// Constant-quality level (NVENC `-cq` / libx264/libx265 `-crf`).
+    pub cq: u32,
     /// Official ChromaFormat: 1 = 4:2:0, 3 = 4:4:4 (真彩).
     pub chroma: u64,
 }
@@ -71,6 +75,7 @@ impl EncoderConfig {
             codec: Codec::H264,
             kind: detect_kind(),
             max_kbps: None,
+            cq: 18,
             chroma: crate::uu_native::video_settings::CHROMA_420,
         }
     }
@@ -132,15 +137,365 @@ fn chroma_args(codec: Codec, kind: EncoderKind, chroma: u64) -> (&'static str, &
     }
 }
 
+/// Legacy entry point: H.265 when a hardware encoder is selected, unless
+/// `UU_VIDEO_CODEC` forces a codec or the real probe has failed.
 pub fn preferred_codec() -> Codec {
-    match std::env::var("UU_VIDEO_CODEC")
-        .unwrap_or_else(|_| "auto".to_owned())
-        .to_ascii_lowercase()
-        .as_str()
+    let h265 = !hevc_probed() || hevc_available();
+    crate::uu_native::video_settings::preferred_codec(true, h265)
+}
+
+/// 0 = not probed, 1 = HEVC really encodes, 2 = unavailable.
+static H265_STATE: AtomicU8 = AtomicU8::new(0);
+/// Last probe result and time. Failures are retried after a cooldown so a
+/// system service that starts before the user's DRM ACL is granted can pick
+/// HEVC up once the graphical session is ready.
+static H265_PROBE: Mutex<Option<(std::time::Instant, bool)>> = Mutex::new(None);
+const HEVC_FAILURE_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// HEVC is only advertised after one real frame encodes: `ffmpeg -encoders`
+/// lists libx265/hevc_nvenc even when the library or driver cannot initialize.
+pub async fn probe_hevc_available() -> bool {
+    if let Some((at, available)) = *H265_PROBE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
     {
-        "h265" | "hevc" => Codec::H265,
-        "h264" | "avc" => Codec::H264,
-        _ => Codec::H264,
+        if available || at.elapsed() < HEVC_FAILURE_RETRY {
+            return available;
+        }
+    }
+    let requested = detect_kind();
+    let mut candidates = vec![requested];
+    if requested != EncoderKind::Cpu {
+        candidates.push(EncoderKind::Cpu);
+    }
+    let mut available = false;
+    for kind in candidates {
+        if probe_hevc_kind(kind).await {
+            tracing::info!("HEVC encoder probe: {} ready", kind.label());
+            available = true;
+            break;
+        }
+    }
+    if !available {
+        tracing::info!("HEVC encoder probe: unavailable; advertising H.264 only");
+    }
+    H265_STATE.store(if available { 1 } else { 2 }, Ordering::Release);
+    *H265_PROBE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some((std::time::Instant::now(), available));
+    available
+}
+
+/// Cached result of [`probe_hevc_available`]. Unknown counts as unavailable
+/// until the host has performed the probe.
+pub fn hevc_available() -> bool {
+    H265_STATE.load(Ordering::Acquire) == 1
+}
+
+pub fn hevc_probed() -> bool {
+    H265_STATE.load(Ordering::Acquire) != 0
+}
+
+fn has_irap(data: &[u8]) -> bool {
+    let mut index = 0;
+    while index + 3 < data.len() {
+        let prefix = if data[index..].starts_with(&[0, 0, 0, 1]) {
+            4
+        } else if data[index..].starts_with(&[0, 0, 1]) {
+            3
+        } else {
+            index += 1;
+            continue;
+        };
+        if let Some(kind) = hevc_nal_kind(data, index + prefix) {
+            // BLA/IDR/CRA are IRAP pictures.
+            if (16..=21).contains(&kind) {
+                return true;
+            }
+        }
+        index += prefix;
+    }
+    false
+}
+
+async fn probe_hevc_kind(kind: EncoderKind) -> bool {
+    let mut config = EncoderConfig::new(256, 256);
+    config.codec = Codec::H265;
+    config.kind = kind;
+    config.fps = 1;
+    let ffmpeg = std::env::var("UU_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_owned());
+    let mut command = Command::new(ffmpeg);
+    command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
+    if kind == EncoderKind::Vaapi {
+        command.args([
+            "-vaapi_device",
+            &std::env::var("UU_VAAPI_DEVICE").unwrap_or_else(|_| "/dev/dri/renderD128".to_owned()),
+        ]);
+    }
+    command.args([
+        "-f",
+        "lavfi",
+        "-i",
+        "color=black:size=256x256:rate=1",
+        "-frames:v",
+        "1",
+        "-an",
+    ]);
+    if kind == EncoderKind::Vaapi {
+        command.args(["-vf", "format=nv12,hwupload"]);
+    }
+    command.args(codec_args(config, "30"));
+    command
+        .args(["-f", "hevc", "pipe:1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    match tokio::time::timeout(std::time::Duration::from_secs(5), command.output()).await {
+        Ok(Ok(output)) => output.status.success() && has_irap(&output.stdout),
+        _ => false,
+    }
+}
+
+/// One FFmpeg codec argument list shared by the stream encoder and the
+/// one-frame HEVC probe. The caller appends `-f <container> pipe:1`.
+fn codec_args(config: EncoderConfig, gop: &str) -> Vec<String> {
+    let maxrate = config
+        .max_kbps
+        .map(|k| format!("{k}k"))
+        .unwrap_or_else(|| "20M".to_owned());
+    let target = config
+        .max_kbps
+        .map(|k| format!("{}k", k * 3 / 4))
+        .unwrap_or_else(|| "16M".to_owned());
+    let buffer = config
+        .max_kbps
+        .map(|k| format!("{}k", (k * 2).clamp(500, 40_000)))
+        .unwrap_or_else(|| "40M".to_owned());
+    let cq = config.cq.to_string();
+    let (profile, pix_fmt) = chroma_args(config.codec, config.kind, config.chroma);
+    let mut args: Vec<String> = Vec::new();
+    match (config.kind, config.codec) {
+        (EncoderKind::Cpu, Codec::H264) => {
+            args.extend(
+                [
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "superfast",
+                    "-tune",
+                    "zerolatency",
+                    "-profile:v",
+                    profile,
+                    "-pix_fmt",
+                    pix_fmt,
+                    "-g",
+                    gop,
+                    "-threads",
+                    "4",
+                    "-maxrate",
+                    &maxrate,
+                    "-bufsize",
+                    &buffer,
+                ]
+                .map(str::to_owned),
+            );
+            if config.max_kbps.is_none() {
+                args.extend(["-crf".to_owned(), cq]);
+            } else {
+                args.extend(["-b:v".to_owned(), target]);
+            }
+            args.extend(
+                [
+                    "-x264-params",
+                    &format!("aud=1:repeat-headers=1:scenecut=0:keyint={gop}:min-keyint={gop}"),
+                    "-flush_packets",
+                    "1",
+                ]
+                .map(str::to_owned),
+            );
+        }
+        (EncoderKind::Cpu, Codec::H265) => {
+            args.extend(
+                [
+                    "-c:v",
+                    "libx265",
+                    "-preset",
+                    "superfast",
+                    "-tune",
+                    "zerolatency",
+                    "-profile:v",
+                    profile,
+                    "-pix_fmt",
+                    pix_fmt,
+                    "-g",
+                    gop,
+                    "-threads",
+                    "4",
+                    "-maxrate",
+                    &maxrate,
+                    "-bufsize",
+                    &buffer,
+                ]
+                .map(str::to_owned),
+            );
+            if config.max_kbps.is_none() {
+                args.extend(["-crf".to_owned(), cq]);
+            } else {
+                args.extend(["-b:v".to_owned(), target]);
+            }
+            args.extend(
+                [
+                    "-x265-params",
+                    &format!(
+                        "aud=1:repeat-headers=1:scenecut=0:keyint={gop}:min-keyint={gop}:bframes=0:rc-lookahead=0"
+                    ),
+                    "-flush_packets", "1",
+                ]
+                .map(str::to_owned),
+            );
+        }
+        (EncoderKind::Nvenc, _) => {
+            let encoder = if config.codec == Codec::H265 {
+                "hevc_nvenc"
+            } else {
+                "h264_nvenc"
+            };
+            args.extend(
+                [
+                    "-c:v",
+                    encoder,
+                    "-preset",
+                    "p4",
+                    "-tune",
+                    "ull",
+                    "-profile:v",
+                    profile,
+                    "-pix_fmt",
+                    pix_fmt,
+                    "-g",
+                    gop,
+                    "-bf",
+                    "0",
+                    "-rc",
+                    "vbr",
+                    "-cq",
+                    &cq,
+                    "-b:v",
+                    &target,
+                    "-maxrate",
+                    &maxrate,
+                    "-bufsize",
+                    &buffer,
+                    "-rc-lookahead",
+                    "0",
+                    "-zerolatency",
+                    "1",
+                    "-aud",
+                    "1",
+                ]
+                .map(str::to_owned),
+            );
+        }
+        (EncoderKind::Vaapi, _) => {
+            let encoder = if config.codec == Codec::H265 {
+                "hevc_vaapi"
+            } else {
+                "h264_vaapi"
+            };
+            args.extend(
+                [
+                    "-c:v",
+                    encoder,
+                    "-profile:v",
+                    profile,
+                    "-g",
+                    gop,
+                    "-bf",
+                    "0",
+                    "-rc_mode",
+                    "VBR",
+                    "-b:v",
+                    &target,
+                    "-maxrate",
+                    &maxrate,
+                    "-bufsize",
+                    &buffer,
+                    "-qmin",
+                    &cq,
+                    "-async_depth",
+                    "1",
+                ]
+                .map(str::to_owned),
+            );
+            if config.codec == Codec::H264 {
+                args.extend(["-aud".to_owned(), "1".to_owned()]);
+            }
+        }
+        (EncoderKind::Qsv, _) => {
+            let encoder = if config.codec == Codec::H265 {
+                "hevc_qsv"
+            } else {
+                "h264_qsv"
+            };
+            args.extend(
+                [
+                    "-c:v",
+                    encoder,
+                    "-preset",
+                    "veryfast",
+                    "-profile:v",
+                    "main",
+                    "-g",
+                    gop,
+                    "-bf",
+                    "0",
+                    "-b:v",
+                    &target,
+                    "-maxrate",
+                    &maxrate,
+                    "-bufsize",
+                    &buffer,
+                ]
+                .map(str::to_owned),
+            );
+        }
+        (EncoderKind::Amf, _) => {
+            let encoder = if config.codec == Codec::H265 {
+                "hevc_amf"
+            } else {
+                "h264_amf"
+            };
+            args.extend(
+                [
+                    "-c:v",
+                    encoder,
+                    "-quality",
+                    "speed",
+                    "-profile:v",
+                    "main",
+                    "-g",
+                    gop,
+                    "-bf",
+                    "0",
+                    "-b:v",
+                    &target,
+                    "-maxrate",
+                    &maxrate,
+                    "-bufsize",
+                    &buffer,
+                ]
+                .map(str::to_owned),
+            );
+        }
+    }
+    args
+}
+
+fn container(codec: Codec) -> &'static str {
+    match codec {
+        Codec::H264 => "h264",
+        Codec::H265 => "hevc",
     }
 }
 
@@ -169,7 +524,6 @@ impl Encoder {
         }
         let ffmpeg = std::env::var("UU_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_owned());
         let (out_w, out_h) = config.output_size();
-        let (profile, pix_fmt) = chroma_args(config.codec, config.kind, config.chroma);
         let odd_native = config.output.is_none()
             && (!config.width.is_multiple_of(2) || !config.height.is_multiple_of(2));
         let mut command = Command::new(ffmpeg);
@@ -209,265 +563,9 @@ impl Encoder {
             command.args(["-vf", &filters.join(",")]);
         }
         let gop = config.fps.clamp(1, 60).to_string();
-        let maxrate = config
-            .max_kbps
-            .map(|k| format!("{k}k"))
-            .unwrap_or_else(|| "20M".to_owned());
-        let target = config
-            .max_kbps
-            .map(|k| format!("{}k", k * 3 / 4))
-            .unwrap_or_else(|| "16M".to_owned());
-        let buffer = config
-            .max_kbps
-            .map(|k| format!("{}k", (k * 2).clamp(500, 40_000)))
-            .unwrap_or_else(|| "40M".to_owned());
-        match (config.kind, config.codec) {
-            (EncoderKind::Cpu, Codec::H264) => {
-                command.args([
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "superfast",
-                    "-tune",
-                    "zerolatency",
-                    "-profile:v",
-                    profile,
-                    "-pix_fmt",
-                    pix_fmt,
-                    "-g",
-                    &gop,
-                    "-threads",
-                    "4",
-                    "-maxrate",
-                    &maxrate,
-                    "-bufsize",
-                    &buffer,
-                    "-x264-params",
-                    &format!("aud=1:repeat-headers=1:scenecut=0:keyint={gop}:min-keyint={gop}"),
-                    "-flush_packets",
-                    "1",
-                    "-f",
-                    "h264",
-                    "pipe:1",
-                ]);
-            }
-            (EncoderKind::Cpu, Codec::H265) => {
-                command.args([
-                    "-c:v", "libx265", "-preset", "superfast", "-tune", "zerolatency",
-                    "-profile:v", profile, "-pix_fmt", pix_fmt, "-g", &gop,
-                    "-threads", "4", "-maxrate", &maxrate, "-bufsize", &buffer,
-                    "-x265-params",
-                    &format!("aud=1:repeat-headers=1:scenecut=0:keyint={gop}:min-keyint={gop}:bframes=0:rc-lookahead=0"),
-                    "-flush_packets", "1", "-f", "hevc", "pipe:1",
-                ]);
-            }
-            (EncoderKind::Nvenc, Codec::H264) => {
-                command.args([
-                    "-c:v",
-                    "h264_nvenc",
-                    "-preset",
-                    "p4",
-                    "-tune",
-                    "ull",
-                    "-profile:v",
-                    profile,
-                    "-pix_fmt",
-                    pix_fmt,
-                    "-g",
-                    &gop,
-                    "-bf",
-                    "0",
-                    "-rc",
-                    "vbr",
-                    "-b:v",
-                    &target,
-                    "-maxrate",
-                    &maxrate,
-                    "-bufsize",
-                    &buffer,
-                    "-rc-lookahead",
-                    "0",
-                    "-zerolatency",
-                    "1",
-                    "-aud",
-                    "1",
-                    "-f",
-                    "h264",
-                    "pipe:1",
-                ]);
-            }
-            (EncoderKind::Nvenc, Codec::H265) => {
-                command.args([
-                    "-c:v",
-                    "hevc_nvenc",
-                    "-preset",
-                    "p4",
-                    "-tune",
-                    "ull",
-                    "-profile:v",
-                    profile,
-                    "-pix_fmt",
-                    pix_fmt,
-                    "-g",
-                    &gop,
-                    "-bf",
-                    "0",
-                    "-rc",
-                    "vbr",
-                    "-b:v",
-                    &target,
-                    "-maxrate",
-                    &maxrate,
-                    "-bufsize",
-                    &buffer,
-                    "-rc-lookahead",
-                    "0",
-                    "-zerolatency",
-                    "1",
-                    "-aud",
-                    "1",
-                    "-f",
-                    "hevc",
-                    "pipe:1",
-                ]);
-            }
-            (EncoderKind::Vaapi, Codec::H264) => {
-                command.args([
-                    "-c:v",
-                    "h264_vaapi",
-                    "-profile:v",
-                    profile,
-                    "-g",
-                    &gop,
-                    "-bf",
-                    "0",
-                    "-b:v",
-                    &target,
-                    "-maxrate",
-                    &maxrate,
-                    "-bufsize",
-                    &buffer,
-                    "-aud",
-                    "1",
-                    "-f",
-                    "h264",
-                    "pipe:1",
-                ]);
-            }
-            (EncoderKind::Vaapi, Codec::H265) => {
-                command.args([
-                    "-c:v",
-                    "hevc_vaapi",
-                    "-profile:v",
-                    profile,
-                    "-g",
-                    &gop,
-                    "-bf",
-                    "0",
-                    "-b:v",
-                    &target,
-                    "-maxrate",
-                    &maxrate,
-                    "-bufsize",
-                    &buffer,
-                    "-f",
-                    "hevc",
-                    "pipe:1",
-                ]);
-            }
-            (EncoderKind::Qsv, Codec::H264) => {
-                command.args([
-                    "-c:v",
-                    "h264_qsv",
-                    "-preset",
-                    "veryfast",
-                    "-profile:v",
-                    "main",
-                    "-g",
-                    &gop,
-                    "-bf",
-                    "0",
-                    "-b:v",
-                    &target,
-                    "-maxrate",
-                    &maxrate,
-                    "-bufsize",
-                    &buffer,
-                    "-f",
-                    "h264",
-                    "pipe:1",
-                ]);
-            }
-            (EncoderKind::Qsv, Codec::H265) => {
-                command.args([
-                    "-c:v",
-                    "hevc_qsv",
-                    "-preset",
-                    "veryfast",
-                    "-profile:v",
-                    "main",
-                    "-g",
-                    &gop,
-                    "-bf",
-                    "0",
-                    "-b:v",
-                    &target,
-                    "-maxrate",
-                    &maxrate,
-                    "-bufsize",
-                    &buffer,
-                    "-f",
-                    "hevc",
-                    "pipe:1",
-                ]);
-            }
-            (EncoderKind::Amf, Codec::H264) => {
-                command.args([
-                    "-c:v",
-                    "h264_amf",
-                    "-quality",
-                    "speed",
-                    "-profile:v",
-                    "main",
-                    "-g",
-                    &gop,
-                    "-bf",
-                    "0",
-                    "-b:v",
-                    &target,
-                    "-maxrate",
-                    &maxrate,
-                    "-bufsize",
-                    &buffer,
-                    "-f",
-                    "h264",
-                    "pipe:1",
-                ]);
-            }
-            (EncoderKind::Amf, Codec::H265) => {
-                command.args([
-                    "-c:v",
-                    "hevc_amf",
-                    "-quality",
-                    "speed",
-                    "-profile:v",
-                    "main",
-                    "-g",
-                    &gop,
-                    "-bf",
-                    "0",
-                    "-b:v",
-                    &target,
-                    "-maxrate",
-                    &maxrate,
-                    "-bufsize",
-                    &buffer,
-                    "-f",
-                    "hevc",
-                    "pipe:1",
-                ]);
-            }
-        }
+        let arguments = codec_args(config, &gop);
+        command.args(&arguments);
+        command.args(["-f", container(config.codec), "pipe:1"]);
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -706,6 +804,40 @@ mod tests {
         assert_eq!(units[0], vec![0, 0, 0, 1, 9, 1, 2]);
         assert_eq!(units[1], vec![0, 0, 0, 1, 9, 3, 4]);
         assert!(data.is_empty());
+    }
+
+    #[test]
+    fn cq_and_crf_rate_control() {
+        let mut config = EncoderConfig::new(1280, 720);
+        config.kind = EncoderKind::Cpu;
+        config.codec = Codec::H264;
+        config.max_kbps = None;
+        config.cq = 23;
+        let args = codec_args(config, "60").join(" ");
+        assert!(args.contains("-crf 23"), "{args}");
+        assert!(!args.contains("-cq"), "{args}");
+
+        config.kind = EncoderKind::Nvenc;
+        let args = codec_args(config, "60").join(" ");
+        assert!(args.contains("-cq 23"), "{args}");
+        assert!(args.contains("-rc vbr"), "{args}");
+
+        config.kind = EncoderKind::Cpu;
+        config.codec = Codec::H265;
+        config.max_kbps = Some(8_000);
+        let args = codec_args(config, "60").join(" ");
+        assert!(args.contains("-b:v 6000k"), "{args}");
+        assert!(!args.contains("-crf"), "{args}");
+    }
+
+    #[test]
+    fn cpu_hevc_probe_arguments_are_production_arguments() {
+        let mut config = EncoderConfig::new(256, 256);
+        config.codec = Codec::H265;
+        config.kind = EncoderKind::Cpu;
+        let args = codec_args(config, "30").join(" ");
+        assert!(args.contains("-c:v libx265"), "{args}");
+        assert!(args.contains("-tune zerolatency"), "{args}");
     }
 
     #[test]

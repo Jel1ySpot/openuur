@@ -13,6 +13,8 @@
   wireplumber,
   pulseaudio,
   wl-clipboard,
+  xrandr,
+  libei,
   glib,
   gtk3,
   qt6,
@@ -29,13 +31,16 @@ let
     wireplumber
     pulseaudio
     wl-clipboard
+    xrandr
     glib
     gtk3
     qt6.qttools
     procps
   ];
   runtimePath = lib.makeBinPath runtimeTools;
-  pamLibraryPath = lib.makeLibraryPath [ pam ];
+  # libpam and libei are dlopen()ed: auto-unlock and portal EIS must find them
+  # without the package linking them at build time.
+  runtimeLibraryPath = lib.makeLibraryPath [ pam libei ];
 in
 rustPlatform.buildRustPackage {
   pname = "openuur";
@@ -80,13 +85,13 @@ rustPlatform.buildRustPackage {
 
   # The host shells out to ffmpeg, loginctl, pactl/wpctl, wl-copy/wl-paste and
   # gio/gtk-launch. The wrapper keeps those tools available even when the
-  # service starts with a minimal PATH. libpam is dlopen()ed at runtime by the
-  # auto-unlock path, so it must be on LD_LIBRARY_PATH in the Nix store.
+  # service starts with a minimal PATH. libpam and libei are dlopen()ed at
+  # runtime, so they must be on LD_LIBRARY_PATH in the Nix store.
   postInstall = ''
     for program in openuur openuurd; do
       wrapProgram "$out/bin/$program" \
         --prefix PATH : "${runtimePath}" \
-        --suffix LD_LIBRARY_PATH : "${pamLibraryPath}"
+        --suffix LD_LIBRARY_PATH : "${runtimeLibraryPath}"
     done
   '';
 

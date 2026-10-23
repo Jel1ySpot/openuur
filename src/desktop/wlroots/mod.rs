@@ -166,7 +166,25 @@ pub(crate) async fn start(options: DesktopOptions) -> Result<DesktopSession, Str
         .set_nonblocking(true)
         .map_err(|error| format!("cannot configure the input wake pipe: {error}"))?;
     let wake_writer = Arc::new(wake_writer);
-    let input: Arc<dyn InputSink> = Arc::new(Input::new(commands.clone(), wake_writer.clone()));
+    let native_input: Arc<dyn InputSink> =
+        Arc::new(Input::new(commands.clone(), wake_writer.clone()));
+    let input: Arc<dyn InputSink> = if super::uinput::wanted(super::Backend::Wlroots) {
+        match super::uinput::UinputInput::open() {
+            Ok(input) => {
+                tracing::info!("desktop input: uinput virtual keyboard and pointer");
+                Arc::new(input)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "uinput unavailable ({}); using native wlroots input",
+                    error.kind()
+                );
+                native_input
+            }
+        }
+    } else {
+        native_input
+    };
     let stop = Arc::new(AtomicBool::new(false));
     let locked = session_lock::watch_locked();
     let power = super::session_power::RemoteSessionPower::subscribe();
@@ -207,6 +225,8 @@ pub(crate) async fn start(options: DesktopOptions) -> Result<DesktopSession, Str
     let wake_hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         input::request_wake(&commands_for_wake, &wake_for_wake);
     });
+    let task = tokio::spawn(std::future::pending::<()>());
+    let abort = task.abort_handle();
     Ok(DesktopSession {
         backend: super::Backend::Wlroots,
         state: desktop,
@@ -214,9 +234,12 @@ pub(crate) async fn start(options: DesktopOptions) -> Result<DesktopSession, Str
         cursor: cursor_rx,
         input,
         stop,
-        task: tokio::spawn(std::future::pending::<()>()),
+        abort,
+        cleanup: Arc::new(tokio::sync::Notify::new()),
         wake: Some(wake_hook),
         clipboard: std::sync::Mutex::new(None),
+        display: None,
+        display_guard: std::sync::Mutex::new(None),
     })
 }
 
@@ -612,6 +635,7 @@ impl WlrootsState {
                 width: output.width,
                 height: output.height,
                 primary: false,
+                mapping_id: None,
             })
             .collect();
         if let Some(first) = screens.first_mut() {
@@ -644,6 +668,7 @@ impl WlrootsState {
                     width,
                     height,
                     primary: false,
+                    mapping_id: None,
                 }
             })
             .collect()

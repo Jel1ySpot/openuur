@@ -12,20 +12,21 @@
 # Debian / Ubuntu
 sudo apt install build-essential pkg-config clang libclang-dev \
   libpipewire-0.3-dev libspa-0.2-dev libxkbcommon-dev xkb-data \
-  ffmpeg xdg-desktop-portal libpam0g wireplumber wl-clipboard
+  ffmpeg xdg-desktop-portal libpam0g wireplumber wl-clipboard \
+  libei1 x11-xserver-utils
 # 按桌面环境再安装对应 portal 后端：
 #   xdg-desktop-portal-gnome / xdg-desktop-portal-kde / xdg-desktop-portal-wlr
 
 # Fedora（ffmpeg 需启用 RPM Fusion）
 sudo dnf install gcc pkgconf-pkg-config clang clang-devel pipewire-devel \
   libxkbcommon-devel xkeyboard-config \
-  ffmpeg xdg-desktop-portal pam wireplumber wl-clipboard
+  ffmpeg xdg-desktop-portal pam wireplumber wl-clipboard libei xrandr
 # 按桌面环境再安装对应 portal 后端：
 #   xdg-desktop-portal-gnome / xdg-desktop-portal-kde / xdg-desktop-portal-wlr
 
 # Arch
 sudo pacman -S base-devel pkgconf clang pipewire libxkbcommon xkeyboard-config \
-  ffmpeg xdg-desktop-portal pam wireplumber wl-clipboard
+  ffmpeg xdg-desktop-portal pam wireplumber wl-clipboard libei xorg-xrandr
 # 按桌面环境再安装对应 portal 后端：
 #   xdg-desktop-portal-gnome / xdg-desktop-portal-kde / xdg-desktop-portal-wlr
 ```
@@ -58,8 +59,20 @@ openuur install          # 用户级 systemd 服务
 - `xdg-desktop-portal` 及对应桌面后端（`xdg-desktop-portal-gnome` / `xdg-desktop-portal-kde` / `xdg-desktop-portal-wlr`）：GNOME/KDE Wayland 的屏幕采集与远程输入；wlroots 桌面（Sway/Hyprland 等）默认走原生协议，不需要 portal
 - `libxkbcommon` + `xkeyboard-config`：原生 wlroots 键盘输入（编译与运行时）
 - `libpam`：锁屏自动解锁
+- `libei`（≥1.1，可选）：portal 远程输入的 EIS 后端；缺少时自动回退 Notify
+- `xrandr`：X11 控制端切换分辨率时新建/切换显示模式（`x11-xserver-utils` / `xorg-xrandr`）
 - `wireplumber`：提供 `wpctl`，用于静音运行
-- `wl-clipboard`：文本剪贴板
+- `wl-clipboard`：Wayland 文本剪贴板（X11 使用内置 XFixes，无需 `xclip`）
+
+`/dev/uinput` 可写时，Wayland/portal 会话默认使用内核虚拟键鼠（布局无关、锁屏可用）。如未生效，安装 udev 规则：
+
+```bash
+echo 'KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", TAG+="uaccess"' \
+  | sudo tee /etc/udev/rules.d/70-openuur-uinput.rules
+sudo udevadm control --reload && sudo udevadm trigger
+```
+
+`UU_INPUT_BACKEND=auto|uinput|native` 可选择输入后端；X11 默认仍用 XTest。
 
 使用 `--no-default-features` 安装时，以上仍是远程桌面、自动解锁、静音和剪贴板功能的运行时依赖。
 
@@ -147,6 +160,9 @@ journalctl --user -u openuurd -f
 rc-service openuurd status
 sv status openuurd
 service openuurd status
+
+# 一键诊断（17 项只含状态，可直接粘贴到 issue）
+openuurd doctor
 ```
 
 ### 5. 连接
@@ -320,7 +336,7 @@ nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#pkg-config nixpkgs#openssl \
 cargo build --release --no-default-features
 ```
 
-运行时还需要 `ffmpeg`（含 `libx264`）；GNOME/KDE Wayland 会话还需要 `xdg-desktop-portal` 和对应桌面后端，wlroots 桌面（Sway/Hyprland）使用原生协议并需要 `libxkbcommon`/`xkeyboard-config`，X11 会话不需要。
+运行时还需要 `ffmpeg`（含 `libx264`；H.265 需要 `libx265` 或硬件编码器）；GNOME/KDE Wayland 会话还需要 `xdg-desktop-portal` 和对应桌面后端，wlroots 桌面（Sway/Hyprland）使用原生协议并需要 `libxkbcommon`/`xkeyboard-config`，X11 会话不需要。X11 分辨率切换需要 `xrandr`；portal EIS 输入需要可选运行时库 `libei`（≥1.1）。
 
 产物：
 
@@ -335,13 +351,20 @@ target/release/openuurd
 |---|---|
 | 多显示器 | portal 一次授权多个 monitor；官方客户端通过 `CaptureConfig.screen_id` 切换 |
 | 采集后端 | `openuurd run --desktop-backend auto\|portal\|wlroots\|x11`、`UU_DESKTOP_BACKEND`；auto 按会话类型选择（GNOME/KDE Wayland → portal，其它 Wayland → wlroots，X11 → x11）。wlroots 不可用（例如脚本自启动的合成器未暴露 wlr 协议）时，auto 回退 portal 并记录日志；显式 `wlroots` 则直接报错 |
+| portal 输入 | 优先 `ConnectToEIS`/libei，按流的 `mapping_id` 匹配区域，缩放、旋转和多显示器下绝对坐标仍准确；portal 不支持 EIS 或缺少 `mapping_id` 时回退 `Notify*`。可见 `/dev/uinput` 时默认改用内核虚拟键鼠 |
+| portal 拒绝 | 用户拒绝/取消（4）、授权超时（5）、缺少显示器或键鼠权限（6）、帧格式/尺寸不可用（8）、尺寸变化需重连（14）视为终止，不再反复重开授权框；其它错误按退避重试 |
+| portal 旋转 | 处理 `SPA_META_VideoTransform`/`wl_output.transform` 的 90/180/270 与翻转，输出方向正确的帧；输入区域由 EIS 映射 |
+| portal 光标 | 默认 `CursorMode::Hidden`，由控制端自绘指针，避免 GNOME/KDE Wayland 上出现合成器光标 + 控制端指针的双指针；`UU_PORTAL_CURSOR=embedded` 可恢复内嵌光标 |
+| 锁屏/挂起输入释放 | 锁屏、休眠、桌面 peer 结束时释放 portal 会话中仍按下的按键/鼠标键（portal 没有 release-all，宿主逐键补发，单次调用 2 秒超时；失败项保留到会话重建后重试），解锁后不会残留 Ctrl/Shift 或鼠标键 |
 | wlroots 后端 | 直接使用 `zwlr_screencopy_manager_v1`（wl_shm 双缓冲、Y_INVERT/XBGR/ABGR 转换）、`zwlr_virtual_pointer_v1`、`zwp_virtual_keyboard_v1`（xkbcommon keymap、修饰键计数、Caps/Num Lock、文本临时 keycode）与 `zwlr_output_power_manager_v1` 唤醒；多显示器绝对坐标使用 `zxdg_output_v1` 逻辑布局（wl_output.geometry 在 wlroots 恒为 0）；锁屏/挂起时立即停帧并释放输入，长文本粘贴也会中止；不支持窗口/虚拟源与光标形状，旋转输出以合成器返回的缓冲区尺寸为准 |
-| X11 后端 | XDamage + MIT-SHM 采集（缺 DAMAGE/SHM 时退化轮询或 `GetImage`）、XTest 绝对/相对指针与按键、120 单位滚轮、临时 keycode 文本输入、XFixes 光标形状同步（serial 去重、≤30 Hz、PNG）、RandR 活动显示器切换；窗口/虚拟源仍请使用 portal；X11 会话暂不支持文本剪贴板 |
+| X11 后端 | XDamage + MIT-SHM 采集（缺 DAMAGE/SHM 时退化轮询或 `GetImage`）、XTest 绝对/相对指针与按键、120 单位滚轮、临时 keycode 文本输入、XFixes 光标形状同步（serial 去重、≤30 Hz、PNG）、RandR 活动显示器切换；XFixes 原生文本剪贴板（任意 X11，无需 xclip/xsel）；窗口/虚拟源仍请使用 portal。`UU_INPUT_BACKEND=uinput` 可强制内核键鼠 |
+| uinput 键鼠 | `/dev/uinput` 虚拟键盘 + 绝对/相对指针、按键、滚轮；Wayland/portal 默认优先，锁屏和 greeter 也可用；失败回退 portal/XTest。设备随会话销毁并逐键释放 |
 | 快捷键映射 | macOS 控制端的 Cmd+C/V/A/F/X/Z 映射为 Ctrl（聚焦终端内 Cmd+C/V 为 Ctrl+Shift），其余 Cmd 组合与单独 Cmd 保持 Super；X11 终端内 Ctrl+V 自动变为 Ctrl+Shift+V；`UU_MAC_SHORTCUTS=0\|1` 强制控制端类型，`UU_TERMINAL_SHORTCUTS=0` 关闭终端转换 |
 | 会话发现 | 系统服务通过 logind 找到账号的活动图形会话，投影 `WAYLAND_DISPLAY`/`DISPLAY`/`XDG_RUNTIME_DIR`/session bus 等 7 个变量；每 2 秒复查，会话切换只断开桌面 peer，终端/文件/端口映射保留；没有会话时明确报「等待图形会话」。没有 logind 时仅在非 root 进程中使用经过 socket 校验的进程环境兜底；root 进程需显式设置 `UU_SESSION_ENV_FALLBACK=1` |
 | 显示源 | `openuurd display source monitor\|window\|virtual`，或 `openuurd run --display-source ...` / `UU_DISPLAY_SOURCE` |
-| 分辨率 | 编码器缩放，不修改宿主机显示模式；显示配置变化时重建采集并保留编码尺寸 |
-| H.264/H.265 | `UU_VIDEO_CODEC=h264\|h265`；默认跟随官方协商 |
+| 分辨率 | X11 直接修改显示模式：优先切换已有模式，缺失时用 CVT reduced-blanking 新建（可高于原生，单边上限 4096），选「原始」或最后一个桌面会话结束时恢复原模式；`UU_DESKTOP_RESIZE=0` 关闭，仅缩放编码画面。Wayland 仍由合成器决定尺寸并编码缩放 |
+| H.264/H.265 | `UU_VIDEO_CODEC=h264\|h265`；硬件编码器默认优先 H.265（Mac 控制端列表首位），软件编码默认 H.264。启动时真实编码一帧 H.265 探测驱动/库，失败则只声明 H.264，不再仅凭 `ffmpeg -encoders` 猜测 |
+| CQ/CRF | NVENC 使用 `-rc vbr -cq`，libx264/libx265 在自动画质使用 `-crf`，固定码率档改为 ABR；画质档 1–5 映射 CQ 30/26/21/17/18，VAAPI 使用 `-qmin` 质量下限 |
 | 真彩 4:4:4 | NVENC / libx264 / libx265；VAAPI/QSV/AMF 保持 4:2:0 |
 | 硬件编码 | `UU_VIDEO_ENCODER=auto\|cpu\|nvenc\|vaapi\|qsv\|amf`；失败时回退软件 |
 | hevc_vaapi | 支持无 AUD 的 HEVC 图像边界切分；驱动不可用时回退软件 |
@@ -350,15 +373,23 @@ target/release/openuurd
 | 锁屏状态/自动解锁 | logind `LockedHint` + PAM；锁屏时发送合成黑帧，官方客户端可进入自动解锁 |
 | 休眠抑制/唤醒 | 有远端 peer 时持有 logind `sleep:idle` block 抑制器，最后一个 peer 断开即释放；`UU_PREVENT_SLEEP=0` 关闭；系统 `PrepareForSleep` 时暂停采集与输入，恢复后唤醒显示器 |
 | 系统操作 | 锁屏、显示桌面、任务管理器、重启、关机 |
-| 文本剪贴板 | GNOME/KDE portal、KDE Klipper、wl-clipboard；聚焦时重读 |
+| 文本剪贴板 | GNOME/KDE portal、KDE Klipper、wl-clipboard，以及任意 X11 的原生 XFixes `CLIPBOARD`（TARGETS/UTF8_STRING/TEXT/STRING，30 KiB 上限）；聚焦时重读，不记录内容 |
 | 文件传输 | 浏览/上传/下载/改名/删除、压缩目录、续传、跳过/覆盖/重名 |
 | 文件保存路径 | `--file-save-path` / `UU_FILE_SAVE_PATH`；通过 SystemMetrics/RemoteDownloadPath 上报 |
 | 端口映射 | 官方端口映射工具；`UU_PORT_MAPPING=0` 关闭 |
 | 应用快捷启动 | 导出 XDG `.desktop` 应用，RPC 23/24 + `LaunchApp` |
 | FeatureFlag/echo | 采集设置、简单动作、系统指标、文件传输、剪贴板能力按实际就绪状态声明 |
+| 自定义画质 | 控制端自定义码率按 **bit/s** 解析（1 Mbps = 1,000,000），编码上限 100 Mbit/s；`CaptureSettingSync` 以同一单位回读 |
+| 登录过期 | 房间接口返回 HTTP 422 / code 1120 时标记登录过期；过期重试前重读配置文件，`openuur login` 写入新 token 后无需重启即可接续，未更新时只提示一次并保持 30 秒低频重试 |
+| RTCP PLI/FIR | 读取视频 RTCP，收到 PLI/FIR 立即重建编码器产生关键帧（≤500 ms 节流），弱网丢包后无需等 1 秒 GOP |
+| 端口映射背压 | 端口映射使用有界队列且不在数据通道回调里等待（避免阻塞同一 SCTP 关联上的桌面输入/终端）；队列满时干净关闭该映射流（FIN + 关闭目标连接），不再静默丢字节破坏 TCP 流 |
 | UU RTP 扩展 | `video-capture-index`、`video-frame-is-new-frame`（SDP extmap + RTP header） |
 | restore token | portal 权限 token 持久化（0600），锁屏/显示变化后尝试免弹窗恢复 |
 | 网络诊断/切换 | 不记录地址/凭据的 ICE 路径与码率日志；断开 4s 后 host 发起 ICE 重启 |
+| 信令租约 | 房间空闲 900 秒后刷新信令凭据；仍有已连接 peer 时推迟，避免打断远控 |
+| STREAMER 通道 | 回应官方控制端的 `{"type":"ping"}` 为 `{"type":"pong"}`，遥测消息不进入输入/剪贴板解析 |
+| 输入所有权 | 每个桌面 peer 持有 DesktopOwner 租约；新 peer 顶替旧 peer，旧 peer 的延迟按键/释放不会注入或清除新会话的按键，租约随连接状态激活/释放 |
+| 诊断 | `openuurd doctor` / `openuur doctor`：17 项探针（系统、会话、显示、后端、portal、PipeWire、wlroots、X11 扩展、uinput、FFmpeg、H.264/H.265 真实探测、编码器、4:4:4、音频、账号/服务），输出不含 token、设备 ID、地址或文件内容 |
 | 二维码登录 | `openuur login --qr` 终端二维码、状态轮询、过期刷新 |
 | DC-KCP | 核心、外层帧和协商属性已实现，默认仍走 SCTP；QUIC 仅保留 SDP 兼容属性 |
 

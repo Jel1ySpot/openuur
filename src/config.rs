@@ -64,6 +64,10 @@ pub struct Config {
     /// Directory the viewer's file-transfer window opens on and receives into.
     #[serde(default)]
     pub file_save_path: Option<String>,
+    /// File this config was loaded from, so a long-running daemon can pick up
+    /// a token written by `openuur login` without a restart.
+    #[serde(skip)]
+    pub source_path: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -82,6 +86,7 @@ impl Default for Config {
             display_source: None,
             desktop_backend: None,
             file_save_path: None,
+            source_path: None,
         }
     }
 }
@@ -107,11 +112,38 @@ impl Config {
 
     pub fn load() -> Result<Self> {
         let path = Self::path()?;
+        Self::load_from(&path)
+    }
+
+    /// Load one explicit config file and remember where it came from.
+    pub fn load_from(path: &Path) -> Result<Self> {
         if !path.exists() {
-            return Ok(Self::default());
+            return Ok(Self {
+                source_path: Some(path.to_path_buf()),
+                ..Self::default()
+            });
         }
-        let text = fs::read_to_string(&path)?;
-        toml::from_str(&text).map_err(|e| Error::Config(format!("{}: {e}", path.display())))
+        let text = fs::read_to_string(path)?;
+        let mut config: Self =
+            toml::from_str(&text).map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+        config.source_path = Some(path.to_path_buf());
+        Ok(config)
+    }
+
+    /// Read the token from the file this config came from, if it changed.
+    /// Used when the API rejects an expired login token so a daemon can adopt
+    /// credentials written by `openuur login`.
+    pub fn reload_token(&self) -> Option<String> {
+        let path = self.source_path.clone().or_else(|| Self::path().ok())?;
+        match Self::load_from(&path) {
+            Ok(config) => config.token,
+            Err(error) => {
+                // Do not hide a broken or unreadable config behind "token
+                // unchanged": it is why a re-login appears not to take effect.
+                tracing::warn!("cannot reload config {}: {error}", path.display());
+                None
+            }
+        }
     }
 
     pub fn load_or_default() -> Self {
@@ -271,4 +303,24 @@ pub fn default_device_name() -> String {
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "openuur-device".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reload_token_reads_the_source_file() {
+        let path = std::env::temp_dir().join(format!(
+            "openuur-config-test-{}-reload.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, "token = \"one\"\n").unwrap();
+        let config = Config::load_from(&path).unwrap();
+        assert_eq!(config.token.as_deref(), Some("one"));
+        assert_eq!(config.reload_token().as_deref(), Some("one"));
+        std::fs::write(&path, "token = \"two\"\n").unwrap();
+        assert_eq!(config.reload_token().as_deref(), Some("two"));
+        let _ = std::fs::remove_file(&path);
+    }
 }

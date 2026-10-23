@@ -25,6 +25,9 @@ enum Command {
     Run(RunArgs),
     /// Show the locally configured identity without printing the token.
     Status,
+    /// Run 17 paste-safe host diagnostics (session, backend, permissions,
+    /// encoders, account and service state).
+    Doctor,
     /// Configure the portal capture source.
     Display {
         #[command(subcommand)]
@@ -76,9 +79,18 @@ async fn main() {
 async fn real_main() -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = Cli::parse();
+    if matches!(cli.command, Command::Doctor) {
+        // The report must be the only diagnostic output.
+        std::env::set_var("RUST_LOG", "openuur=warn,openuurd=warn");
+    }
     init_logging(cli.verbose);
     if let Some(path) = &cli.config {
         std::env::set_var("OPENUUR_CONFIG", path);
+    }
+    if matches!(cli.command, Command::Doctor) {
+        // Diagnosis must not generate ids or rewrite the config file.
+        openuur::doctor::run().await.map_err(anyhow::Error::msg)?;
+        return Ok(());
     }
     let mut config = load_config(cli.config.as_deref())?;
     config.ensure_client_id();
@@ -139,6 +151,7 @@ async fn real_main() -> anyhow::Result<()> {
             }
             openuur::uu_native::host::run(config, args.password).await?;
         }
+        Command::Doctor => unreachable!("doctor is handled before loading the config"),
         Command::Status => {
             let device_id = config.ensure_device_id()?;
             let device_name = config.ensure_device_name();
@@ -231,8 +244,7 @@ fn init_logging(verbose: bool) {
 fn load_config(path: Option<&std::path::Path>) -> anyhow::Result<Config> {
     if let Some(path) = path {
         if path.exists() {
-            let text = std::fs::read_to_string(path)?;
-            return Ok(toml::from_str(&text)?);
+            return Ok(Config::load_from(path)?);
         }
     }
     Ok(Config::load()?)

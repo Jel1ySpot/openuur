@@ -25,12 +25,29 @@ use crate::desktop::input_map::{keysym_for, smooth_scroll, windows_vk_to_keysym,
 use crate::desktop::{InputSink, ScreenInfo};
 
 pub(super) enum Command {
-    Absolute { x: f64, y: f64 },
-    Relative { dx: i32, dy: i32 },
-    Button { button: i32, pressed: bool },
-    Scroll { dx: i32, dy: i32 },
-    Key { vk: i32, pressed: bool },
+    Absolute {
+        x: f64,
+        y: f64,
+    },
+    Relative {
+        dx: i32,
+        dy: i32,
+    },
+    Button {
+        button: i32,
+        pressed: bool,
+    },
+    Scroll {
+        dx: i32,
+        dy: i32,
+    },
+    Key {
+        vk: i32,
+        pressed: bool,
+    },
     Text(String),
+    /// Release every key/button this backend still holds.
+    Reset,
     Wake,
 }
 
@@ -85,6 +102,10 @@ impl InputSink for Input {
     fn text(&self, text: &str) {
         self.send(Command::Text(text.to_owned()), true);
     }
+
+    fn reset(&self) {
+        self.send(Command::Reset, true);
+    }
 }
 
 /// Wake the compositor-owned output-power object.
@@ -100,7 +121,8 @@ pub(super) fn request_wake(
 impl WlrootsState {
     pub(super) fn drain_commands(&mut self) {
         while let Ok(command) = self.commands.try_recv() {
-            if (self.locked || self.suspended) && !matches!(command, Command::Wake) {
+            if (self.locked || self.suspended) && !matches!(command, Command::Wake | Command::Reset)
+            {
                 continue;
             }
             self.handle_command(command);
@@ -180,6 +202,7 @@ impl WlrootsState {
                 }
             }
             Command::Text(text) => self.type_text(&text),
+            Command::Reset => self.release_all(),
             Command::Wake => self.set_output_power(true),
         }
     }
@@ -534,6 +557,7 @@ mod tests {
             width,
             height,
             primary: id == 0,
+            mapping_id: None,
         }
     }
 

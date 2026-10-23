@@ -55,6 +55,8 @@ enum Command {
     /// service for the invoking account. System services start at boot, before
     /// the graphical session exists.
     Install(InstallArgs),
+    /// Run 17 paste-safe host diagnostics (same report as `openuurd doctor`).
+    Doctor,
 }
 
 #[derive(Args)]
@@ -154,11 +156,19 @@ async fn main() {
 async fn real_main() -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = Cli::parse();
+    if matches!(cli.command, Command::Doctor) {
+        // The report must be the only diagnostic output.
+        std::env::set_var("RUST_LOG", "openuur=warn,openuurd=warn");
+    }
     init_logging(cli.verbose);
     if let Some(path) = &cli.config {
         std::env::set_var("OPENUUR_CONFIG", path);
     }
     let command = match cli.command {
+        Command::Doctor => {
+            openuur::doctor::run().await.map_err(anyhow::Error::msg)?;
+            return Ok(());
+        }
         Command::Install(args) => {
             let report = openuur::install::run(openuur::install::InstallOptions {
                 binary: args.binary,
@@ -245,7 +255,9 @@ async fn real_main() -> anyhow::Result<()> {
                 .await?;
             }
         }
-        Command::Install(_) => unreachable!("install is handled before loading the config"),
+        Command::Install(_) | Command::Doctor => {
+            unreachable!("handled before loading the config")
+        }
     }
     Ok(())
 }
@@ -268,8 +280,7 @@ fn init_logging(verbose: bool) {
 fn load_config(path: Option<&std::path::Path>) -> anyhow::Result<Config> {
     if let Some(path) = path {
         if path.exists() {
-            let text = std::fs::read_to_string(path)?;
-            return Ok(toml::from_str(&text)?);
+            return Ok(Config::load_from(path)?);
         }
     }
     Ok(Config::load()?)

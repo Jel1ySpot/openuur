@@ -9,7 +9,7 @@
 //! back.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
@@ -26,6 +26,13 @@ use super::super::{DesktopState, InputSink};
 
 const INIT_TIMEOUT: Duration = Duration::from_secs(10);
 const COMMAND_WAIT: Duration = Duration::from_millis(50);
+
+/// Newest X11 input thread. XTest key/button state is server-global, so an
+/// older thread that stops after a newer peer exists must not release the new
+/// peer's held keys. Ownership replacement still uses `Reset` before the new
+/// peer starts injecting.
+static CURRENT_INPUT: AtomicU64 = AtomicU64::new(0);
+static NEXT_INPUT: AtomicU64 = AtomicU64::new(1);
 /// One notch is 120 units, matching the Windows wheel delta.
 const NOTCH: f64 = 120.0;
 
@@ -47,9 +54,20 @@ pub(crate) async fn start(
 ) -> Result<Arc<dyn InputSink>, String> {
     let (commands, receiver) = mpsc::sync_channel(1024);
     let (ready_tx, ready_rx) = oneshot::channel();
+    let generation = NEXT_INPUT.fetch_add(1, Ordering::Relaxed);
     std::thread::Builder::new()
         .name("openuur-x11-input".into())
-        .spawn(move || run(display.as_deref(), state, stop, locked, receiver, ready_tx))
+        .spawn(move || {
+            run(
+                display.as_deref(),
+                state,
+                stop,
+                locked,
+                receiver,
+                ready_tx,
+                generation,
+            )
+        })
         .map_err(|error| format!("cannot start the X11 input thread: {error}"))?;
     match tokio::time::timeout(INIT_TIMEOUT, ready_rx).await {
         Ok(Ok(Ok(()))) => Ok(Arc::new(Input { commands })),
@@ -66,6 +84,8 @@ enum Command {
     Scroll(i32, i32),
     Key(i32, bool),
     Text(String),
+    /// Release every key/button this backend still holds.
+    Reset,
 }
 
 struct Input {
@@ -112,6 +132,10 @@ impl InputSink for Input {
     fn text(&self, text: &str) {
         self.send(Command::Text(text.to_owned()), true);
     }
+
+    fn reset(&self) {
+        self.send(Command::Reset, true);
+    }
 }
 
 fn run(
@@ -121,6 +145,7 @@ fn run(
     locked: watch::Receiver<Option<bool>>,
     commands: mpsc::Receiver<Command>,
     ready: oneshot::Sender<Result<(), String>>,
+    generation: u64,
 ) {
     let (connection, screen_num) = match x11rb::connect(display) {
         Ok(connected) => connected,
@@ -137,6 +162,7 @@ fn run(
             return;
         }
     };
+    CURRENT_INPUT.store(generation, Ordering::Release);
     let _ = ready.send(Ok(()));
 
     let power = super::super::session_power::RemoteSessionPower::subscribe();
@@ -161,11 +187,18 @@ fn run(
                 release_all(&connection, &mut keyboard, &mut held, &mut buttons);
                 paused = true;
             }
-            // Keep draining the command channel so it never backs up.
+            // Keep draining the command channel so it never backs up. A
+            // Reset still releases input after a lease replacement.
             match commands.recv_timeout(COMMAND_WAIT) {
+                Ok(Command::Reset) => {
+                    let _guard = keyboard_lock();
+                    release_all(&connection, &mut keyboard, &mut held, &mut buttons);
+                    let _ = connection.flush();
+                }
                 Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
+            continue;
         }
         paused = false;
 
@@ -185,6 +218,10 @@ fn run(
                 Command::Scroll(dx, dy) => wheel.scroll(&connection, dx, dy),
                 Command::Key(vk, pressed) => {
                     keyboard.key(&connection, root, vk, pressed, &mut held)
+                }
+                Command::Reset => {
+                    release_all(&connection, &mut keyboard, &mut held, &mut buttons);
+                    Ok(())
                 }
                 Command::Text(text) => {
                     // The viewer may send CRLF; a terminal should see one
@@ -220,8 +257,12 @@ fn run(
 
     {
         let _guard = keyboard_lock();
-        release_all(&connection, &mut keyboard, &mut held, &mut buttons);
-        keyboard.restore(&connection);
+        // A superseded thread must not release keys the newest session now
+        // holds. Claim-time Reset already released this session's old keys.
+        if CURRENT_INPUT.load(Ordering::Acquire) == generation {
+            release_all(&connection, &mut keyboard, &mut held, &mut buttons);
+            keyboard.restore(&connection);
+        }
     }
     let _ = connection.flush();
 }

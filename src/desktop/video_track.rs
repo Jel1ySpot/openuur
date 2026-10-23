@@ -81,6 +81,8 @@ pub struct VideoTrack {
     h265: TrackLocalStaticRTP,
     has_h264: AtomicBool,
     has_h265: AtomicBool,
+    /// Set when the receiver asks for a keyframe (RTCP PLI/FIR).
+    keyframe: AtomicBool,
     timeline: Mutex<Timeline>,
 }
 
@@ -117,12 +119,23 @@ impl VideoTrack {
             h265: track(Codec::H265),
             has_h264: AtomicBool::new(false),
             has_h265: AtomicBool::new(false),
+            keyframe: AtomicBool::new(false),
             timeline: Mutex::new(Timeline {
                 sequence: rand::random(),
                 timestamp: rand::random(),
                 h264: H264Payloader::default(),
             }),
         }
+    }
+
+    /// The receiver asked for an intra frame (RTCP PLI or FIR).
+    pub fn request_keyframe(&self) {
+        self.keyframe.store(true, Ordering::Release);
+    }
+
+    /// Take and clear a pending keyframe request.
+    pub fn take_keyframe_request(&self) -> bool {
+        self.keyframe.swap(false, Ordering::AcqRel)
     }
 
     pub fn supports(&self, codec: Codec) -> bool {

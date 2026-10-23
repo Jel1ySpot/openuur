@@ -101,6 +101,24 @@ impl Error {
     pub fn is_unauthorized(&self) -> bool {
         matches!(self, Self::Api { status, .. } if matches!(status, 401 | 403))
     }
+
+    /// The API rejected the login token: HTTP 422 with `code: 1120`
+    /// ("token invalid or expired"), or a plain 401/403.
+    pub fn is_token_expired(&self) -> bool {
+        match self {
+            Self::Api {
+                status,
+                code,
+                message,
+                ..
+            } => {
+                matches!(status, 401 | 403)
+                    || (*status == 422 && (*code == Some(1120) || message.contains("1120")))
+            }
+            Self::Unauthorized(_) | Self::NotLoggedIn => true,
+            _ => false,
+        }
+    }
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for Error {
@@ -127,5 +145,18 @@ pub struct DisplayError<'a>(pub &'a Error);
 impl fmt::Display for DisplayError<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_expiry_is_recognized() {
+        assert!(Error::api(422, r#"{"code":1120,"msg":"Token invalid"}"#).is_token_expired());
+        assert!(Error::api(401, "{}").is_token_expired());
+        assert!(!Error::api(422, r#"{"code":2002,"msg":"bad shape"}"#).is_token_expired());
+        assert!(!Error::api(500, "{}").is_token_expired());
     }
 }
