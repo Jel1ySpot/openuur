@@ -40,6 +40,36 @@ struct Route {
 struct StartedDesktop {
     desktop: Arc<DesktopSession>,
     session: session_env::SessionEnv,
+    source: desktop::SourceKind,
+}
+
+/// The portal session stays open after its viewer disconnects. Reusing it is
+/// the only reliable way to avoid a fresh screen-share consent prompt on
+/// every connection: not every compositor returns a restore token.
+struct CachedDesktop {
+    desktop: Arc<DesktopSession>,
+    session: session_env::SessionEnv,
+    source: desktop::SourceKind,
+}
+
+impl CachedDesktop {
+    fn reusable(&self, source: desktop::SourceKind, current: Option<&SessionIdentity>) -> bool {
+        desktop_cache_matches(self.source, &self.session.identity(), source, current)
+    }
+}
+
+fn desktop_cache_matches(
+    cached_source: desktop::SourceKind,
+    cached_session: &SessionIdentity,
+    source: desktop::SourceKind,
+    current: Option<&SessionIdentity>,
+) -> bool {
+    cached_source == source && current == Some(cached_session)
+}
+
+enum PendingDesktop {
+    Starting(tokio::sync::oneshot::Receiver<std::result::Result<StartedDesktop, String>>),
+    Ready(StartedDesktop),
 }
 
 struct Pending {
@@ -50,7 +80,7 @@ struct Pending {
     header: Value,
     created_at: std::time::Instant,
     controller_mac: bool,
-    desktop: Option<tokio::sync::oneshot::Receiver<std::result::Result<StartedDesktop, String>>>,
+    desktop: Option<PendingDesktop>,
 }
 
 /// Process-lifetime host state. Signaling rooms reconnect underneath it, but
@@ -60,6 +90,9 @@ struct HostRuntime {
     peers: HashMap<String, HostPeer>,
     pending: Vec<Pending>,
     outbox: Outbox,
+    /// Portal capture retained across peer connections, until the graphical
+    /// session changes.
+    desktop_cache: Option<CachedDesktop>,
 }
 
 enum RoomExit {
@@ -76,6 +109,9 @@ struct HostPeer {
     pc: Arc<webrtc::peer_connection::RTCPeerConnection>,
     route: Route,
     desktop: Option<Arc<DesktopSession>>,
+    /// Active BUNDLE mid/m-line negotiated by this answer. Outgoing ICE
+    /// candidates use it because webrtc-rs leaves `sdpMid` empty.
+    bundle_media: Arc<Mutex<Option<(String, u16)>>>,
     /// Set exactly for desktop peers; used to close captures that belong to a
     /// session which no longer exists.
     session: Option<SessionIdentity>,
@@ -92,7 +128,7 @@ impl HostPeer {
         rtc::set_offer(&self.pc, offer)
             .await
             .map_err(Error::Transport)?;
-        let answer = rtc::local_answer(&self.pc)
+        let answer = rtc::local_answer(&self.pc, &self.bundle_media)
             .await
             .map_err(Error::Transport)?;
         Ok(answer)
@@ -121,7 +157,12 @@ impl HostPeer {
             return;
         }
         if let Some(desktop) = &self.desktop {
-            desktop.stop();
+            if desktop.backend != desktop::Backend::Wayland {
+                desktop.stop();
+            }
+            // Portal capture is cached across connections. Its input lease
+            // releases held keys only when this peer is still the owner, so a
+            // closing old peer cannot clear the replacement's input.
             self.actions.session_ended();
         }
     }
@@ -144,6 +185,7 @@ pub async fn run(mut config: Config, password: Option<String>) -> Result<()> {
         peers: HashMap::new(),
         pending: Vec::new(),
         outbox: Outbox::new(),
+        desktop_cache: None,
     };
     let mut backoff = Duration::from_secs(3);
     let mut expired_logged = false;
@@ -218,6 +260,7 @@ pub async fn run(mut config: Config, password: Option<String>) -> Result<()> {
                             }
                             let current = session_rx.borrow_and_update().available().cloned();
                             close_desktop_peers(&mut runtime, current.as_ref()).await;
+                            drop_desktop_cache(&mut runtime, current.as_ref());
                             cancel_pending_desktop(&mut runtime);
                         }
                     }
@@ -271,6 +314,7 @@ async fn room_loop(config: &Config, runtime: &mut HostRuntime, signal: &mut Sign
     // Apply a session change that happened while signaling was disconnected.
     let current = session_rx.borrow_and_update().available().cloned();
     close_desktop_peers(runtime, current.as_ref()).await;
+    drop_desktop_cache(runtime, current.as_ref());
 
     loop {
         tokio::select! {
@@ -294,10 +338,10 @@ async fn room_loop(config: &Config, runtime: &mut HostRuntime, signal: &mut Sign
                         tracing::info!("native UU device status: {status} availability={available}");
                     }
                     Event::Text { name, data } if name == "be-controlled" => {
-                        remember_connect(&mut runtime.pending, data, Vec::new(), config);
+                        remember_connect(runtime, data, Vec::new(), config);
                     }
                     Event::Binary { name, data, attachments } if name == "be-controlled" => {
-                        remember_connect(&mut runtime.pending, data, attachments, config);
+                        remember_connect(runtime, data, attachments, config);
                     }
                     Event::Text { name, data } | Event::Binary { name, data, .. } if name == "soac" => {
                         handle_soac(
@@ -305,6 +349,7 @@ async fn room_loop(config: &Config, runtime: &mut HostRuntime, signal: &mut Sign
                             &runtime.outbox,
                             &mut runtime.peers,
                             &mut runtime.pending,
+                            &mut runtime.desktop_cache,
                             &data,
                             config,
                         )
@@ -365,6 +410,7 @@ async fn room_loop(config: &Config, runtime: &mut HostRuntime, signal: &mut Sign
                         }
                     }
                     close_desktop_peers(runtime, current.as_ref()).await;
+                    drop_desktop_cache(runtime, current.as_ref());
                     cancel_pending_desktop(runtime);
                 }
             }
@@ -406,7 +452,7 @@ async fn maintain(runtime: &mut HostRuntime) {
 }
 
 fn remember_connect(
-    pending: &mut Vec<Pending>,
+    runtime: &mut HostRuntime,
     data: Value,
     attachments: Vec<Vec<u8>>,
     config: &Config,
@@ -449,79 +495,112 @@ fn remember_connect(
         .and_then(|fields| wire::uint(&fields, 8));
     let controller_mac = crate::desktop::input_map::controller_is_mac(&header, platform);
     let desktop = if matches!(capture_type, 1 | 2) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
         let source = if capture_type == 2 {
             desktop::SourceKind::Window
         } else {
             config.display_source()
         };
-        let key = desktop::portal_permissions::key(source.as_str());
-        let options = DesktopOptions {
-            restore_token: desktop::portal_permissions::restore_token(&key),
-            source,
-            clipboard: true,
-        };
-        let choice = config.desktop_backend();
-        tokio::spawn(async move {
-            let result = async {
-                let session = session_env::wait_for_session(session_env::SESSION_WAIT).await?;
-                // The monitor is the sole writer of the projected environment;
-                // re-applying here could revert a newer session it just applied.
-                let selection = desktop::effective_selection(choice, &session);
-                // Auto keeps non-GNOME/KDE Wayland sessions working through
-                // the portal when the compositor lacks the wlr protocols;
-                // an explicit wlroots request fails instead.
-                let resolved = desktop::backend_for_source(
-                    selection,
-                    options.source,
-                    choice == desktop::BackendChoice::Auto,
-                )?;
-                if resolved != selection.effective {
-                    tracing::warn!(
-                        "the native backend captures whole outputs; \
-                         using xdg-desktop-portal for this capture source"
-                    );
-                }
-                let backend = if resolved == desktop::Backend::Wlroots {
-                    match tokio::task::spawn_blocking(desktop::probe_wlroots).await {
-                        Ok(Ok(())) => desktop::Backend::Wlroots,
-                        Ok(Err(error)) if choice == desktop::BackendChoice::Auto => {
-                            tracing::warn!(
-                                "native wlroots capture unavailable ({error}); \
-                                 using xdg-desktop-portal"
-                            );
-                            desktop::Backend::Wayland
-                        }
-                        Ok(Err(error)) => {
-                            return Err(format!("wlroots backend unavailable: {error}"))
-                        }
-                        Err(error) => {
-                            return Err(format!("wlroots capability probe failed: {error}"))
-                        }
-                    }
-                } else {
-                    resolved
+        let current_identity = session_env::current().map(|env| env.identity());
+        let cached = runtime
+            .desktop_cache
+            .as_ref()
+            .filter(|cached| {
+                !cached.desktop.is_stopped() && cached.reusable(source, current_identity.as_ref())
+            })
+            .map(|cached| {
+                tracing::info!(
+                    "reusing the open portal capture session for source={}",
+                    source.as_str()
+                );
+                PendingDesktop::Ready(StartedDesktop {
+                    desktop: cached.desktop.clone(),
+                    session: cached.session.clone(),
+                    source,
+                })
+            });
+        match cached {
+            Some(ready) => Some(ready),
+            None => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let key = desktop::portal_permissions::key(source.as_str());
+                let options = DesktopOptions {
+                    restore_token: desktop::portal_permissions::restore_token(&key),
+                    source,
+                    clipboard: true,
                 };
-                let desktop = desktop::start_with(backend, options).await.map(Arc::new)?;
-                // A session change while the portal was starting must not
-                // attach a stale capture to a later offer.
-                if session_env::current().map(|env| env.identity()) != Some(session.identity()) {
-                    desktop.stop();
-                    return Err("graphical session changed during capture startup".to_owned());
-                }
-                Ok(StartedDesktop { desktop, session })
+                let choice = config.desktop_backend();
+                tokio::spawn(async move {
+                    let result = async {
+                        let session =
+                            session_env::wait_for_session(session_env::SESSION_WAIT).await?;
+                        // The monitor is the sole writer of the projected
+                        // environment; re-applying here could revert a newer
+                        // session it just applied.
+                        let selection = desktop::effective_selection(choice, &session);
+                        // Auto keeps non-GNOME/KDE Wayland sessions working
+                        // through the portal when the compositor lacks the
+                        // wlr protocols; an explicit wlroots request fails.
+                        let resolved = desktop::backend_for_source(
+                            selection,
+                            options.source,
+                            choice == desktop::BackendChoice::Auto,
+                        )?;
+                        if resolved != selection.effective {
+                            tracing::warn!(
+                                "the native backend captures whole outputs; \
+                                 using xdg-desktop-portal for this capture source"
+                            );
+                        }
+                        let backend = if resolved == desktop::Backend::Wlroots {
+                            match tokio::task::spawn_blocking(desktop::probe_wlroots).await {
+                                Ok(Ok(())) => desktop::Backend::Wlroots,
+                                Ok(Err(error)) if choice == desktop::BackendChoice::Auto => {
+                                    tracing::warn!(
+                                        "native wlroots capture unavailable ({error}); \
+                                         using xdg-desktop-portal"
+                                    );
+                                    desktop::Backend::Wayland
+                                }
+                                Ok(Err(error)) => {
+                                    return Err(format!("wlroots backend unavailable: {error}"))
+                                }
+                                Err(error) => {
+                                    return Err(format!("wlroots capability probe failed: {error}"))
+                                }
+                            }
+                        } else {
+                            resolved
+                        };
+                        let desktop = desktop::start_with(backend, options).await.map(Arc::new)?;
+                        // A session change while the portal was starting must
+                        // not attach a stale capture to a later offer.
+                        if session_env::current().map(|env| env.identity())
+                            != Some(session.identity())
+                        {
+                            desktop.stop();
+                            return Err(
+                                "graphical session changed during capture startup".to_owned()
+                            );
+                        }
+                        Ok(StartedDesktop {
+                            desktop,
+                            session,
+                            source,
+                        })
+                    }
+                    .await;
+                    let _ = tx.send(result);
+                });
+                Some(PendingDesktop::Starting(rx))
             }
-            .await;
-            let _ = tx.send(result);
-        });
-        Some(rx)
+        }
     } else {
         None
     };
-    if pending.len() >= 32 {
-        pending.remove(0);
+    if runtime.pending.len() >= 32 {
+        runtime.pending.remove(0);
     }
-    pending.push(Pending {
+    runtime.pending.push(Pending {
         capture_type,
         ice: find_str(&header, &["ice_id", "iceId"]),
         client: find_str(&header, &["client_id", "clientId"]).unwrap_or_default(),
@@ -669,7 +748,9 @@ async fn create_peer(
                 RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
             ) {
                 if let Some(desktop) = &desktop {
-                    desktop.stop();
+                    if desktop.backend != desktop::Backend::Wayland {
+                        desktop.stop();
+                    }
                     actions.session_ended();
                 }
             }
@@ -692,14 +773,21 @@ async fn create_peer(
 
     let outbox_for_candidates = outbox.clone();
     let signal_route = route.clone();
+    let peer_bundle_media = Arc::new(Mutex::new(None));
+    let candidate_bundle_media = peer_bundle_media.clone();
     pc.on_ice_candidate(Box::new(move |candidate| {
         let outbox = outbox_for_candidates.clone();
         let route = signal_route.clone();
+        let bundle_media = candidate_bundle_media.clone();
         Box::pin(async move {
             let Some(candidate) = candidate else {
                 return;
             };
-            let Some(value) = rtc::candidate_json(&candidate) else {
+            let media = bundle_media
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let Some(value) = rtc::candidate_json(&candidate, media.as_ref()) else {
                 return;
             };
             outbox.soac(json!({
@@ -741,6 +829,7 @@ async fn create_peer(
         pc,
         route,
         desktop,
+        bundle_media: peer_bundle_media,
         session,
         actions,
         stopped: AtomicBool::new(false),
@@ -1419,7 +1508,7 @@ fn install_host_channels(
             let clipboard = if label == "TEXT_DATA_CHANNEL" {
                 let bridge = desktop
                     .as_ref()
-                    .and_then(|desktop| desktop.take_clipboard())
+                    .and_then(|desktop| desktop.clipboard_bridge())
                     .unwrap_or_else(crate::desktop::clipboard::start);
                 let crate::desktop::clipboard::ClipboardBridge {
                     incoming,
@@ -1428,8 +1517,9 @@ fn install_host_channels(
                 } = bridge;
                 {
                     let flag = clipboard_ready.clone();
+                    let mut ready = ready;
                     tokio::spawn(async move {
-                        if ready.await.unwrap_or(false) {
+                        if ready.wait_for(|value| *value).await.is_ok() {
                             flag.store(true, Ordering::Release);
                         }
                     });
@@ -2208,6 +2298,7 @@ async fn handle_soac(
     outbox: &Outbox,
     peers: &mut HashMap<String, HostPeer>,
     pending: &mut Vec<Pending>,
+    desktop_cache: &mut Option<CachedDesktop>,
     data: &Value,
     config: &Config,
 ) {
@@ -2275,8 +2366,8 @@ async fn handle_soac(
                 .map(|item| item.controller_mac)
                 .unwrap_or_else(|| crate::desktop::input_map::controller_is_mac(&header, None));
             let mut desktop = if matches!(capture_type, 1 | 2) {
-                let receiver = request.as_mut().and_then(|item| item.desktop.take());
-                match receiver {
+                let pending_desktop = request.as_mut().and_then(|item| item.desktop.take());
+                match pending_desktop {
                     None => {
                         // The request was cancelled (for example by a
                         // session change). Still answer; CONTROL reports the
@@ -2284,7 +2375,8 @@ async fn handle_soac(
                         tracing::warn!("native UU desktop offer has no capture request");
                         None
                     }
-                    Some(receiver) => {
+                    Some(PendingDesktop::Ready(started)) => Some(started),
+                    Some(PendingDesktop::Starting(receiver)) => {
                         match tokio::time::timeout(Duration::from_secs(90), receiver).await {
                             Ok(Ok(Ok(started))) => Some(started),
                             Ok(Ok(Err(error))) => {
@@ -2323,6 +2415,9 @@ async fn handle_soac(
                     );
                     desktop = None;
                 }
+            }
+            if let Some(started) = &desktop {
+                cache_portal_desktop(desktop_cache, peers, started);
             }
             let session = desktop.as_ref().map(|started| started.session.identity());
             match create_peer(
@@ -2405,6 +2500,55 @@ async fn handle_soac(
             }
         }
         _ => {}
+    }
+}
+
+/// Retain a portal capture for the next offer. X11/wlroots sessions own a
+/// display mode or output state that must be released at the end of a remote
+/// session, so only the portal (which does not change the display) is cached.
+fn cache_portal_desktop(
+    cache: &mut Option<CachedDesktop>,
+    peers: &HashMap<String, HostPeer>,
+    started: &StartedDesktop,
+) {
+    if started.desktop.backend != desktop::Backend::Wayland {
+        return;
+    }
+    let next = CachedDesktop {
+        desktop: started.desktop.clone(),
+        session: started.session.clone(),
+        source: started.source,
+    };
+    let old = cache.replace(next);
+    if let Some(old) = old {
+        if !Arc::ptr_eq(&old.desktop, &started.desktop)
+            && !peers.values().any(|peer| {
+                peer.desktop
+                    .as_ref()
+                    .is_some_and(|desktop| Arc::ptr_eq(desktop, &old.desktop))
+            })
+        {
+            // No peer uses the previous source any more; close its portal
+            // instead of leaving a second capture indicator running.
+            old.desktop.stop();
+        }
+    }
+}
+
+/// Drop the retained portal capture when it no longer belongs to the active
+/// login session. Peers tied to an old session are already closed by
+/// `close_desktop_peers`, so this handle is the last owner.
+fn drop_desktop_cache(runtime: &mut HostRuntime, current: Option<&session_env::SessionEnv>) {
+    let current = current.map(session_env::SessionEnv::identity);
+    let stale = runtime
+        .desktop_cache
+        .as_ref()
+        .is_some_and(|cached| current.as_ref() != Some(&cached.session.identity()));
+    if stale {
+        if let Some(cached) = runtime.desktop_cache.take() {
+            cached.desktop.stop();
+            tracing::info!("released cached portal capture: graphical session changed");
+        }
     }
 }
 
@@ -2629,18 +2773,24 @@ mod tests {
 
     #[test]
     fn terminal_connect_options_are_remembered() {
-        let mut pending = Vec::new();
+        let mut runtime = HostRuntime {
+            manager: SessionManager::new(None),
+            peers: HashMap::new(),
+            pending: Vec::new(),
+            outbox: Outbox::new(),
+            desktop_cache: None,
+        };
         let attachment = wire::connect_options(8, 4, "device", "4.43.0");
         remember_connect(
-            &mut pending,
+            &mut runtime,
             json!({"ice_id":"ice","client_id":"client","app_control_id":"app"}),
             vec![attachment],
             &Config::default(),
         );
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].ice.as_deref(), Some("ice"));
-        assert_eq!(pending[0].client, "client");
-        assert_eq!(pending[0].app, "app");
+        assert_eq!(runtime.pending.len(), 1);
+        assert_eq!(runtime.pending[0].ice.as_deref(), Some("ice"));
+        assert_eq!(runtime.pending[0].client, "client");
+        assert_eq!(runtime.pending[0].app, "app");
     }
 
     #[test]
@@ -2730,6 +2880,36 @@ mod tests {
         // session appears.
         assert!(desktop_peer_mismatch(true, None, Some(&new)));
     }
+
+    #[test]
+    fn cached_portal_capture_is_scoped_to_source_and_session() {
+        let session = identity(100);
+        let other = identity(200);
+        assert!(desktop_cache_matches(
+            desktop::SourceKind::Monitor,
+            &session,
+            desktop::SourceKind::Monitor,
+            Some(&session)
+        ));
+        assert!(!desktop_cache_matches(
+            desktop::SourceKind::Monitor,
+            &session,
+            desktop::SourceKind::Window,
+            Some(&session)
+        ));
+        assert!(!desktop_cache_matches(
+            desktop::SourceKind::Monitor,
+            &session,
+            desktop::SourceKind::Monitor,
+            Some(&other)
+        ));
+        assert!(!desktop_cache_matches(
+            desktop::SourceKind::Monitor,
+            &session,
+            desktop::SourceKind::Monitor,
+            None
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -2814,10 +2994,19 @@ mod local_webrtc_tests {
             })
         }));
 
-        let offer = rtc::local_offer(&viewer_pc).await.unwrap();
+        let viewer_bundle = Mutex::new(None);
+        let offer = rtc::local_offer(&viewer_pc, &viewer_bundle).await.unwrap();
         rtc::set_offer(&host_pc, &offer).await.unwrap();
-        let answer = rtc::local_answer(&host_pc).await.unwrap();
+        let host_bundle = Mutex::new(None);
+        let answer = rtc::local_answer(&host_pc, &host_bundle).await.unwrap();
         rtc::set_answer(&viewer_pc, &answer).await.unwrap();
+        assert!(
+            host_bundle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some(),
+            "answer must expose an active BUNDLE m-line"
+        );
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while tokio::time::Instant::now() < deadline {

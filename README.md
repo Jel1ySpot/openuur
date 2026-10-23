@@ -167,7 +167,7 @@ openuurd doctor
 
 ### 5. 连接
 
-在另一台设备的官方 UU 客户端中选择该设备并打开「远程桌面」。首次连接 portal 后端仍需要在图形会话中确认屏幕共享/远程输入授权。
+在另一台设备的官方 UU 客户端中选择该设备并打开「远程桌面」。首次连接 portal 后端仍需要在图形会话中确认屏幕共享/远程输入授权；同一图形会话内断开后重连会复用该授权会话，不再重复确认。
 
 > 提示：系统服务适合需要开机自启且账号会话稳定的机器。没有活动图形会话时，`openuurd` 仍提供终端/文件/端口映射，远程桌面会在登录后恢复；桌面请求在登录前会快速失败。推荐优先使用系统级服务以获得开机可用性。
 
@@ -214,7 +214,7 @@ openuurd run
 openuurd run --password 'your-password'
 ```
 
-远程桌面要求 `openuurd` 能找到该账号**已登录的图形会话**：Wayland 会话通过 xdg-desktop-portal（首次连接会弹出屏幕共享 + 远程输入授权；系统服务会通过 logind 投影 `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`/session bus），X11 会话直接使用 XDamage/XTest（不需要 portal）。在没有图形会话的 greeter 阶段仍提供终端、文件传输与端口映射，但不会采集 greeter 桌面；登录后桌面自动接入。
+远程桌面要求 `openuurd` 能找到该账号**已登录的图形会话**：Wayland 会话通过 xdg-desktop-portal（首次连接会弹出屏幕共享 + 远程输入授权，之后的连接复用同一会话；系统服务会通过 logind 投影 `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`/session bus），X11 会话直接使用 XDamage/XTest（不需要 portal）。在没有图形会话的 greeter 阶段仍提供终端、文件传输与端口映射，但不会采集 greeter 桌面；登录后桌面自动接入。
 
 `--no-online` 只生成/显示本地设备身份，不连接 UU 信令：
 
@@ -353,6 +353,7 @@ target/release/openuurd
 | 采集后端 | `openuurd run --desktop-backend auto\|portal\|wlroots\|x11`、`UU_DESKTOP_BACKEND`；auto 按会话类型选择（GNOME/KDE Wayland → portal，其它 Wayland → wlroots，X11 → x11）。wlroots 不可用（例如脚本自启动的合成器未暴露 wlr 协议）时，auto 回退 portal 并记录日志；显式 `wlroots` 则直接报错 |
 | portal 输入 | 优先 `ConnectToEIS`/libei，按流的 `mapping_id` 匹配区域，缩放、旋转和多显示器下绝对坐标仍准确；portal 不支持 EIS 或缺少 `mapping_id` 时回退 `Notify*`。可见 `/dev/uinput` 时默认改用内核虚拟键鼠 |
 | portal 拒绝 | 用户拒绝/取消（4）、授权超时（5）、缺少显示器或键鼠权限（6）、帧格式/尺寸不可用（8）、尺寸变化需重连（14）视为终止，不再反复重开授权框；其它错误按退避重试 |
+| portal 会话复用 | 首次授权后保留 portal 采集会话；控制端断开重连时直接复用，不再重复弹出屏幕共享/远程输入确认（compositor 未返回 restore token 时同样生效）；图形会话切换或进程退出时释放 |
 | portal 旋转 | 处理 `SPA_META_VideoTransform`/`wl_output.transform` 的 90/180/270 与翻转，输出方向正确的帧；输入区域由 EIS 映射 |
 | portal 光标 | 默认 `CursorMode::Hidden`，由控制端自绘指针，避免 GNOME/KDE Wayland 上出现合成器光标 + 控制端指针的双指针；`UU_PORTAL_CURSOR=embedded` 可恢复内嵌光标 |
 | 锁屏/挂起输入释放 | 锁屏、休眠、桌面 peer 结束时释放 portal 会话中仍按下的按键/鼠标键（portal 没有 release-all，宿主逐键补发，单次调用 2 秒超时；失败项保留到会话重建后重试），解锁后不会残留 Ctrl/Shift 或鼠标键 |
@@ -386,6 +387,7 @@ target/release/openuurd
 | UU RTP 扩展 | `video-capture-index`、`video-frame-is-new-frame`（SDP extmap + RTP header） |
 | restore token | portal 权限 token 持久化（0600），锁屏/显示变化后尝试免弹窗恢复 |
 | 网络诊断/切换 | 不记录地址/凭据的 ICE 路径与码率日志；断开 4s 后 host 发起 ICE 重启 |
+| 跨网络 ICE | 主机/控制端候选携带协商的 BUNDLE `sdpMid`/`sdpMLineIndex`（webrtc-rs 原始候选为空），并排除 ZeroTier、容器桥、libvirt 等不可达虚拟网卡；物理网卡、公网与 TURN 候选正常参与检查 |
 | 信令租约 | 房间空闲 900 秒后刷新信令凭据；仍有已连接 peer 时推迟，避免打断远控 |
 | STREAMER 通道 | 回应官方控制端的 `{"type":"ping"}` 为 `{"type":"pong"}`，遥测消息不进入输入/剪贴板解析 |
 | 输入所有权 | 每个桌面 peer 持有 DesktopOwner 租约；新 peer 顶替旧 peer，旧 peer 的延迟按键/释放不会注入或清除新会话的按键，租约随连接状态激活/释放 |

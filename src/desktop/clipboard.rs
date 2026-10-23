@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::watch;
 
 pub const MAX_TEXT: usize = 30 * 1024;
 
@@ -37,10 +37,11 @@ fn text_mime(mime: &str) -> bool {
     )
 }
 
+#[derive(Clone)]
 pub struct ClipboardBridge {
     pub incoming: watch::Sender<Option<String>>,
     pub outgoing: watch::Receiver<Option<String>>,
-    pub ready: oneshot::Receiver<bool>,
+    pub ready: watch::Receiver<bool>,
 }
 
 pub fn start() -> ClipboardBridge {
@@ -72,8 +73,8 @@ pub fn start() -> ClipboardBridge {
 fn unavailable() -> ClipboardBridge {
     let (incoming, _) = watch::channel(None);
     let (_, outgoing) = watch::channel(None);
-    let (ready_tx, ready) = oneshot::channel();
-    let _ = ready_tx.send(false);
+    let (ready_tx, ready) = watch::channel(false);
+    ready_tx.send_replace(false);
     ClipboardBridge {
         incoming,
         outgoing,
@@ -100,9 +101,9 @@ fn qdbus_clipboard_works() -> bool {
 fn start_qdbus() -> ClipboardBridge {
     let (incoming, mut input) = watch::channel::<Option<String>>(None);
     let (output, outgoing) = watch::channel::<Option<String>>(None);
-    let (ready_tx, ready) = oneshot::channel();
+    let (ready_tx, ready) = watch::channel(false);
     tokio::spawn(async move {
-        let _ = ready_tx.send(true);
+        ready_tx.send_replace(true);
         let mut last = None::<String>;
         let mut tick = tokio::time::interval(Duration::from_millis(300));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -155,9 +156,9 @@ fn start_qdbus() -> ClipboardBridge {
 fn start_wl() -> ClipboardBridge {
     let (incoming, mut input) = watch::channel::<Option<String>>(None);
     let (output, outgoing) = watch::channel::<Option<String>>(None);
-    let (ready_tx, ready) = oneshot::channel();
+    let (ready_tx, ready) = watch::channel(false);
     tokio::spawn(async move {
-        let _ = ready_tx.send(true);
+        ready_tx.send_replace(true);
         let mut owner: Option<Child> = None;
         let mut last = None::<String>;
         let mut tick = tokio::time::interval(Duration::from_millis(250));
@@ -234,7 +235,7 @@ pub fn start_portal(
 
     let (incoming, mut incoming_rx) = watch::channel::<Option<String>>(None);
     let (outgoing, outgoing_rx) = watch::channel::<Option<String>>(None);
-    let (ready_tx, ready) = oneshot::channel();
+    let (ready_tx, ready) = watch::channel(false);
     let pending = Arc::new(std::sync::Mutex::new(None::<String>));
     let last_outgoing = Arc::new(std::sync::Mutex::new(None::<String>));
     let last_mime = Arc::new(std::sync::Mutex::new(None::<String>));
@@ -319,7 +320,7 @@ pub fn start_portal(
         let last_mime = last_mime.clone();
         let mut focus = focus_receiver();
         tokio::spawn(async move {
-            let _ = ready_tx.send(true);
+            ready_tx.send_replace(true);
             let mut tick = tokio::time::interval(Duration::from_secs(2));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -703,7 +704,7 @@ pub fn start_x11_at(display: Option<&str>) -> ClipboardBridge {
 
     let (incoming, mut input) = watch::channel::<Option<String>>(None);
     let (output, outgoing) = watch::channel::<Option<String>>(None);
-    let (ready_tx, ready) = oneshot::channel();
+    let (ready_tx, ready) = watch::channel(false);
     let display = display.map(str::to_owned);
     std::thread::Builder::new()
         .name("openuur-x11-clipboard".into())
@@ -712,11 +713,11 @@ pub fn start_x11_at(display: Option<&str>) -> ClipboardBridge {
                 Ok(state) => state,
                 Err(error) => {
                     tracing::warn!("native X11 clipboard unavailable: {error}");
-                    let _ = ready_tx.send(false);
+                    ready_tx.send_replace(false);
                     return;
                 }
             };
-            let _ = ready_tx.send(true);
+            ready_tx.send_replace(true);
             while !output.is_closed() && input.has_changed().is_ok() {
                 if input.has_changed().unwrap_or(false) {
                     if let Some(text) = input.borrow_and_update().clone() {
@@ -888,12 +889,13 @@ mod x11_tests {
     async fn xfixes_clipboard_round_trip() {
         let (_server, display) = start_xvfb();
         let mut bridge = start_x11_at(Some(&display));
-        assert!(
-            tokio::time::timeout(Duration::from_secs(3), &mut bridge.ready)
-                .await
-                .unwrap()
-                .unwrap()
-        );
+        let ready = tokio::time::timeout(
+            Duration::from_secs(3),
+            bridge.ready.wait_for(|value| *value),
+        )
+        .await
+        .unwrap();
+        assert!(ready.is_ok());
 
         let external = "external ✓ text";
         let (connection, screen) = x11rb::connect(Some(&display)).unwrap();

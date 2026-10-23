@@ -70,19 +70,23 @@ pub async fn run(
         .map_err(Error::Transport)?;
     let early = Arc::new(Mutex::new(Vec::<Value>::new()));
     let answer_seen = Arc::new(AtomicBool::new(false));
+    let bundle_media = Arc::new(Mutex::new(None));
     install_candidates(
         &pc,
         route.clone(),
         signal.sender(),
         early.clone(),
         answer_seen.clone(),
+        bundle_media.clone(),
     );
     let channels = rtc::data_channels(&pc).await.map_err(Error::Transport)?;
     let (incoming_tx, mut incoming_rx) = mpsc::unbounded_channel::<(usize, Vec<u8>)>();
     let echo_seen = Arc::new(AtomicBool::new(false));
     install_channels(&channels, incoming_tx, echo_seen.clone());
 
-    let offer_sdp = rtc::local_offer(&pc).await.map_err(Error::Transport)?;
+    let offer_sdp = rtc::local_offer(&pc, &bundle_media)
+        .await
+        .map_err(Error::Transport)?;
     tracing::info!("native UU offer created ({} bytes)", offer_sdp.len());
     signal.soac(json!({
         "client_id": remote_client,
@@ -191,6 +195,7 @@ fn install_candidates(
     sender: super::signal::Sender,
     early: Arc<Mutex<Vec<Value>>>,
     answered: Arc<AtomicBool>,
+    bundle_media: Arc<Mutex<Option<(String, u16)>>>,
 ) {
     let callback_pc = pc.clone();
     pc.on_ice_candidate(Box::new(move |candidate| {
@@ -199,11 +204,16 @@ fn install_candidates(
         let pc = callback_pc.clone();
         let early = early.clone();
         let answered = answered.clone();
+        let bundle_media = bundle_media.clone();
         Box::pin(async move {
             let Some(candidate) = candidate else {
                 return;
             };
-            let Some(value) = rtc::candidate_json(&candidate) else {
+            let media = bundle_media
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let Some(value) = rtc::candidate_json(&candidate, media.as_ref()) else {
                 return;
             };
             let route = route.lock().unwrap().clone();

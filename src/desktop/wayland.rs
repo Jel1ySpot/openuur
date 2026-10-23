@@ -819,6 +819,7 @@ async fn supervise(
     let _ = current.pipewire.shutdown();
     // Let `DesktopSession::stop` abort promptly instead of waiting out its
     // grace period once the releases above are done.
+    stop.store(true, Ordering::Release);
     cleanup.notify_one();
     tracing::info!("Wayland desktop capture stopped");
 }

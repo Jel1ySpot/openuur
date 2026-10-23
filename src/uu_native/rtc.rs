@@ -4,7 +4,7 @@ use base64::Engine;
 use flate2::read::GzDecoder;
 use serde_json::Value;
 use std::io::Read;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::setting_engine::SettingEngine;
@@ -59,11 +59,22 @@ pub fn api(answerer: bool) -> Result<webrtc::api::API, String> {
             .map_err(|e| format!("set DTLS role: {e}"))?;
     }
     settings.set_ice_multicast_dns_mode(webrtc::ice::mdns::MulticastDnsMode::Disabled);
+    // Virtual/overlay links (ZeroTier, container bridges, libvirt) advertise
+    // candidates that cannot carry the media path. Offering them makes the
+    // viewer spend its connectivity checks on unreachable addresses instead
+    // of the physical LAN/public interface.
+    settings.set_interface_filter(Box::new(ice_interface_allowed));
     Ok(APIBuilder::new()
         .with_media_engine(media)
         .with_setting_engine(settings)
         .with_interceptor_registry(registry)
         .build())
+}
+
+fn ice_interface_allowed(name: &str) -> bool {
+    !["zt", "docker", "br-", "veth", "virbr", "lo"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 pub fn ice_config(value: &Value) -> Result<RTCConfiguration, String> {
@@ -142,13 +153,57 @@ pub async fn add_candidate(pc: &Arc<RTCPeerConnection>, value: &Value) -> Result
 
 pub fn candidate_json(
     candidate: &webrtc::ice_transport::ice_candidate::RTCIceCandidate,
+    bundle_media: Option<&(String, u16)>,
 ) -> Option<Value> {
     let init = candidate.to_json().ok()?;
+    // webrtc-rs reports an empty `sdpMid` on gathered candidates and a fixed
+    // index 0. The official viewer validates the media association, so use the
+    // active BUNDLE m-line that produced the answer for every candidate.
+    let (mid, index) = match bundle_media {
+        Some((mid, index)) => (mid.clone(), Some(*index)),
+        None => (
+            init.sdp_mid
+                .as_deref()
+                .filter(|mid| !mid.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| "0".to_owned()),
+            init.sdp_mline_index,
+        ),
+    };
     Some(serde_json::json!({
         "candidate": init.candidate,
-        "sdpMid": init.sdp_mid,
-        "sdpMLineIndex": init.sdp_mline_index,
+        "sdpMid": mid,
+        "sdpMLineIndex": index,
     }))
+}
+
+/// Pick the active media section from the BUNDLE group. The answer's first
+/// bundled m-line carries the ICE transport shared by every data channel.
+fn bundle_media(sdp: &str) -> Option<(String, u16)> {
+    let preferred: Vec<&str> = sdp
+        .lines()
+        .find_map(|line| line.strip_prefix("a=group:BUNDLE "))?
+        .split_whitespace()
+        .collect();
+    let mut sections: Vec<(bool, Option<String>)> = Vec::new();
+    for line in sdp.lines() {
+        if let Some(media) = line.strip_prefix("m=") {
+            let port = media.split_whitespace().nth(1)?;
+            sections.push((port != "0", None));
+        } else if let Some(mid) = line.strip_prefix("a=mid:") {
+            if let Some(section) = sections.last_mut() {
+                section.1 = Some(mid.to_owned());
+            }
+        }
+    }
+    for mid in preferred {
+        for (index, (active, section_mid)) in sections.iter().enumerate() {
+            if *active && section_mid.as_deref() == Some(mid) {
+                return Some((mid.to_owned(), index.try_into().ok()?));
+            }
+        }
+    }
+    None
 }
 
 pub fn answer_sdp(value: &Value) -> Result<String, String> {
@@ -238,24 +293,42 @@ pub async fn set_answer(pc: &Arc<RTCPeerConnection>, sdp: &str) -> Result<(), St
     .map_err(|e| format!("set remote answer: {e}"))
 }
 
-pub async fn local_answer(pc: &Arc<RTCPeerConnection>) -> Result<String, String> {
+pub async fn local_answer(
+    pc: &Arc<RTCPeerConnection>,
+    bundle: &Mutex<Option<(String, u16)>>,
+) -> Result<String, String> {
     let answer = pc
         .create_answer(None)
         .await
         .map_err(|e| format!("create answer: {e}"))?;
     tracing::debug!("native UU answer shape: {}", sdp_shape(&answer.sdp));
+    // Record the association before `set_local_description` starts ICE
+    // gathering, otherwise the first candidate can be sent with an empty mid.
+    if let Some(media) = bundle_media(&answer.sdp) {
+        *bundle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(media);
+    }
     pc.set_local_description(answer.clone())
         .await
         .map_err(|e| format!("set local answer: {e}"))?;
     Ok(with_max_message_size(&answer.sdp))
 }
 
-pub async fn local_offer(pc: &Arc<RTCPeerConnection>) -> Result<String, String> {
+pub async fn local_offer(
+    pc: &Arc<RTCPeerConnection>,
+    bundle: &Mutex<Option<(String, u16)>>,
+) -> Result<String, String> {
     let offer = pc
         .create_offer(None)
         .await
         .map_err(|e| format!("create offer: {e}"))?;
     tracing::debug!("native UU offer shape: {}", sdp_shape(&offer.sdp));
+    if let Some(media) = bundle_media(&offer.sdp) {
+        *bundle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(media);
+    }
     pc.set_local_description(offer.clone())
         .await
         .map_err(|e| format!("set local offer: {e}"))?;
@@ -310,5 +383,53 @@ mod tests {
         assert!(out.contains("a=x-uuremote-quic"));
         assert!(out.contains("a=max-message-size:262144"));
         assert!(!sdp.contains("x-uuremote"));
+    }
+
+    #[test]
+    fn bundle_media_uses_the_first_active_bundled_section() {
+        let sdp = "v=0\r\na=group:BUNDLE 2 1\r\n\
+                   m=audio 0 RTP/AVP 0\r\na=mid:0\r\n\
+                   m=video 9 RTP/AVP 96\r\na=mid:1\r\n\
+                   m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:2\r\n";
+        assert_eq!(bundle_media(sdp), Some(("2".to_owned(), 2)));
+        let reordered = "v=0\r\na=group:BUNDLE 1 2\r\n\
+                         m=video 9 RTP/AVP 96\r\na=mid:1\r\n\
+                         m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:2\r\n";
+        assert_eq!(bundle_media(reordered), Some(("1".to_owned(), 0)));
+        assert_eq!(bundle_media("v=0\r\n"), None);
+    }
+
+    #[test]
+    fn candidate_json_replaces_webrtc_empty_mid_with_bundle_media() {
+        use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
+        use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType;
+        use webrtc::ice_transport::ice_protocol::RTCIceProtocol;
+        let candidate = RTCIceCandidate {
+            foundation: "1".to_owned(),
+            priority: 1,
+            address: "192.0.2.1".to_owned(),
+            protocol: RTCIceProtocol::Udp,
+            port: 5000,
+            typ: RTCIceCandidateType::Host,
+            component: 1,
+            ..Default::default()
+        };
+        let media = ("video".to_owned(), 1);
+        let value = candidate_json(&candidate, Some(&media)).unwrap();
+        assert_eq!(value["sdpMid"], "video");
+        assert_eq!(value["sdpMLineIndex"], 1);
+        let fallback = candidate_json(&candidate, None).unwrap();
+        assert_eq!(fallback["sdpMid"], "0");
+        assert_eq!(fallback["sdpMLineIndex"], 0);
+    }
+
+    #[test]
+    fn ice_skips_overlay_and_container_interfaces_only() {
+        for name in ["ztfp6jdvog", "docker0", "br-1a2b", "veth12", "virbr0", "lo"] {
+            assert!(!ice_interface_allowed(name), "{name}");
+        }
+        for name in ["eno1", "enp5s0", "wlp3s0", "eth0"] {
+            assert!(ice_interface_allowed(name), "{name}");
+        }
     }
 }

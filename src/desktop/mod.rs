@@ -438,6 +438,8 @@ pub struct DesktopSession {
     cleanup: Arc<tokio::sync::Notify>,
     /// Backend-specific display wake (wlroots output power).
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Clipboard bridge for this portal session. It is cloned per connection;
+    /// the channels and portal listener are shared.
     clipboard: std::sync::Mutex<Option<clipboard::ClipboardBridge>>,
     /// X11 display this session captures, when it has an explicit one.
     display: Option<String>,
@@ -463,6 +465,12 @@ impl DesktopSession {
 
     pub fn input(&self) -> Arc<dyn InputSink> {
         self.input.clone()
+    }
+
+    /// True once the backend has stopped or is stopping. A cached portal
+    /// session must not be handed to a new peer after a terminal portal error.
+    pub fn is_stopped(&self) -> bool {
+        self.stop.load(Ordering::Acquire)
     }
 
     /// Apply a viewer resolution choice to the host display.
@@ -520,13 +528,13 @@ impl DesktopSession {
         self.state.generation.subscribe()
     }
 
-    /// Take the portal clipboard bridge for this desktop connection. It is
-    /// created once and reused; a second caller gets `None`.
-    pub fn take_clipboard(&self) -> Option<clipboard::ClipboardBridge> {
+    /// Clipboard bridge for this desktop connection. The portal listener is
+    /// shared, so cached sessions keep clipboard support across reconnects.
+    pub fn clipboard_bridge(&self) -> Option<clipboard::ClipboardBridge> {
         self.clipboard
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
+            .clone()
     }
 
     pub fn stop(&self) {
