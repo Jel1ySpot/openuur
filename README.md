@@ -365,3 +365,7 @@ target/release/openuurd
 ## 协议参考
 
 原生 UU 终端字段和互操作行为参考了公开项目 [`VallierDev/uu-remote-linux`](https://github.com/VallierDev/uu-remote-linux) 的验证结果；本仓库的 `src/uu_native/` 是根据二进制分析的独立实现。
+
+## 许可证
+
+本项目以 **MIT** 许可证发布，完整文本见 [LICENSE](LICENSE)。`src/uu_native/` 与各桌面后端均为独立实现，不包含参考项目的 GPL 代码或资源。
